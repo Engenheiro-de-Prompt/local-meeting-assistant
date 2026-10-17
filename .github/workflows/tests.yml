@@ -1,0 +1,34 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system test dependency
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Syntax checks
+        run: |
+          python -m py_compile live_meeting_app.py tests/*.py
+          bash -n start.sh
+          python - <<'PY'
+          import pathlib, re, subprocess, tempfile
+          text = pathlib.Path('web/index.html').read_text(encoding='utf-8')
+          script = re.search(r'<script>(.*?)</script>', text, re.S).group(1)
+          with tempfile.NamedTemporaryFile('w', suffix='.js') as f:
+              f.write(script)
+              f.flush()
+              subprocess.run(['node', '--check', f.name], check=True)
+          PY

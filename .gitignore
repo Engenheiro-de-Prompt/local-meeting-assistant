@@ -1,0 +1,27 @@
+# Bytecode, virtual environments, and build outputs
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# User recordings, transcripts, analysis, and private evaluation data
+recordings/
+meeting-data/
+Gravações_Reunioes/
+Ao_Vivo/
+evidence/
+tests/evaluate_existing_audio.py
+.cache/
