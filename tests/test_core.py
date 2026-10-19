@@ -20,8 +20,16 @@ class LiveMeetingCoreTests(unittest.TestCase):
         boxes = [{"id": f"card_{i}", "title": f"Card {i}", "prompt": "Prompt"} for i in range(27)]
         normalized = app.normalize_boxes(boxes)
         self.assertEqual(len(normalized), 27)
+        self.assertEqual(app.normalize_boxes([]), [])
+        disabled = app.normalize_boxes([{"id": "disabled", "title": "Disabled", "prompt": "Prompt", "enabled": False}])
+        self.assertFalse(disabled[0]["enabled"])
+        noted = app.normalize_boxes([{"id": "card", "title": "Card", "prompt": "Prompt", "notes": "Keep the caveat visible."}])
+        self.assertEqual(noted[0]["notes"], "Keep the caveat visible.")
+        self.assertEqual(app.normalize_boxes([{"id": "card", "title": "Card", "prompt": "Prompt"}])[0]["notes"], "")
         with self.assertRaises(ValueError):
             app.normalize_boxes([{"id": "same", "title": "A", "prompt": "P"}, {"id": "same", "title": "B", "prompt": "P"}])
+        with self.assertRaises(ValueError):
+            app.normalize_boxes([{"id": "card", "title": "Card", "prompt": "Prompt", "notes": "x" * (app.MAX_NOTES_CHARS + 1)}])
 
     def test_analysis_schema_requires_a_summary_and_exact_box_results(self):
         schema = app.analysis_json_schema(app.default_boxes())

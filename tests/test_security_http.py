@@ -80,6 +80,22 @@ class LocalServerSecurityTests(unittest.TestCase):
         self.thread.join(timeout=3)
         self.assertFalse(self.thread.is_alive())
 
+    def test_live_boxes_endpoint_updates_active_session_configuration(self):
+        self.manager.session = {"state": "recording", "started_monotonic": time.monotonic(), "elapsed_s": 1,
+            "segments": [{"start": 0, "end": 1, "text": "Decision pending."}], "next_chunk": 0,
+            "session_id": "fixture-session", "llm_model": "gemma4:e4b", "ollama_port": 11435,
+            "analysis_interval_s": 60, "cards": app.default_boxes(), "analyses": {}, "final_analysis": {}}
+        headers = {"Host": f"127.0.0.1:{self.port}", "Origin": f"http://127.0.0.1:{self.port}", "Content-Type": "application/json"}
+        boxes = [{"id": "custom", "title": "Risk check", "prompt": "Find open risks.",
+                  "notes": "Watch for the deadline.", "enabled": True}]
+        with patch.object(self.manager, "_persist"):
+            status, _, body = self.request("POST", "/api/live-boxes", headers, json.dumps({"boxes": boxes}).encode())
+        self.assertEqual(status, 200)
+        result = app.strict_json_loads(body.decode())
+        self.assertEqual(result["cards"][0]["notes"], "Watch for the deadline.")
+        self.assertTrue(self.manager.session["force_analysis"])
+        self.assertEqual(set(self.manager.session["analyses"]), set())
+
     def test_post_requires_same_origin_and_rejects_unknown_route(self):
         headers = {"Host": f"127.0.0.1:{self.port}", "Origin": f"http://127.0.0.1:{self.port}", "Content-Type": "application/json"}
         status, _, _ = self.request("POST", "/api/analyze", headers, b"{}")

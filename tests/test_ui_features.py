@@ -37,6 +37,13 @@ class DashboardFeatureTests(unittest.TestCase):
         self.assertIn("transcrição completa é preservada", HTML)
         self.assertNotIn("não corta a conversa", HTML)
 
+    def test_live_box_editor_has_notes_and_posts_changes_during_an_active_session(self):
+        self.assertIn('id="liveBoxStatus"', HTML)
+        self.assertIn("Observações para o LLM", HTML)
+        self.assertIn("/api/live-boxes", HTML)
+        self.assertIn("notes:b.notes", HTML)
+        self.assertIn("scheduleLiveBoxSave()", HTML)
+
     def test_live_start_keeps_error_visible_and_final_analysis_is_a_busy_state(self):
         self.assertIn("operationError=e.message", HTML)
         self.assertIn("'final_analysis'", HTML)

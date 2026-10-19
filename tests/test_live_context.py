@@ -99,7 +99,7 @@ class LiveContextRequestTests(unittest.TestCase):
 
     def test_request_sends_full_transcript_without_previous_summary_or_truncation(self):
         transcript = "Fact from the beginning. " + ("Neutral synthetic discussion. " * 1300) + "Latest status update."
-        boxes = [{"id": "questions", "title": "Questions", "prompt": "Use the whole meeting."}]
+        boxes = [{"id": "questions", "title": "Questions", "prompt": "Use the whole meeting.", "notes": "Prioritize Friday's deadline."}]
         connection = FakeConnection("127.0.0.1", 11435, 120)
         with patch.object(app.http.client, "HTTPConnection", return_value=connection):
             summary, results = app._ollama_call(11435, "gemma4:e4b", transcript, boxes, "stale summary must not override transcript")
@@ -107,6 +107,7 @@ class LiveContextRequestTests(unittest.TestCase):
         self.assertEqual(user_payload["contexto_reuniao"], transcript)
         self.assertNotIn("resumo_anterior", user_payload)
         self.assertEqual(user_payload["modo_de_contexto"], "transcrição integral sem compactação")
+        self.assertEqual(user_payload["caixas"][0]["observacoes_do_usuario"], "Prioritize Friday's deadline.")
         self.assertGreater(connection.body["options"]["num_ctx"], 4096)
         self.assertEqual(summary, "Synthetic cumulative summary.")
         self.assertEqual(results, {"questions": "Grounded synthetic result."})

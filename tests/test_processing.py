@@ -39,6 +39,90 @@ def write_chunk(path):
 
 
 class ProcessingLoopTests(unittest.TestCase):
+    def test_updated_live_cards_are_used_on_the_next_request_and_removed_results_disappear(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager, _ = make_manager(pathlib.Path(td), "test-live-card-update")
+            manager.session["segments"].append({"start": 0, "end": 4, "text": "The next deadline is Friday."})
+            calls = []
+            def fake_ollama(_port, _model, _transcript, boxes, _summary, _context_compaction=None):
+                calls.append([dict(box) for box in boxes])
+                return "Updated context.", {box["id"]: "Updated result." for box in boxes}
+            manager.session["cards"] = [dict(box) for box in app.default_boxes()]
+            with patch.object(app, "_ollama_call", side_effect=fake_ollama):
+                manager._maybe_analyze(force=True)
+                current = [{"id": "custom_now", "title": "Risks", "prompt": "Find unresolved risks.",
+                            "notes": "Pay special attention to the Friday deadline.", "enabled": True}]
+                manager.update_live_boxes(current)
+                self.assertTrue(manager.session["force_analysis"])
+                manager._maybe_analyze(force=False)
+            self.assertEqual(calls[1][0]["id"], "custom_now")
+            self.assertEqual(calls[1][0]["prompt"], "Find unresolved risks.")
+            self.assertEqual(calls[1][0]["notes"], "Pay special attention to the Friday deadline.")
+            self.assertEqual(set(manager.session["analyses"]), {"custom_now"})
+            self.assertEqual(manager.session["cards"], app.normalize_boxes(current))
+
+    def test_live_card_edit_during_llm_call_discards_stale_result_and_requeues_latest_prompts(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager, _ = make_manager(pathlib.Path(td), "test-live-card-race")
+            manager.session["segments"].append({"start": 0, "end": 4, "text": "A decision is pending."})
+            entered, release = threading.Event(), threading.Event()
+            calls = []
+            def fake_ollama(_port, _model, _transcript, boxes, _summary, _context_compaction=None):
+                calls.append([dict(box) for box in boxes])
+                if len(calls) == 1:
+                    entered.set()
+                    self.assertTrue(release.wait(3))
+                return "Summary.", {box["id"]: "Result." for box in boxes}
+            with patch.object(app, "_ollama_call", side_effect=fake_ollama):
+                worker = threading.Thread(target=manager._maybe_analyze, kwargs={"force": True})
+                worker.start()
+                self.assertTrue(entered.wait(2))
+                latest = [{"id": "live", "title": "Latest", "prompt": "Use current details.",
+                           "notes": "Updated while the old request was running.", "enabled": True}]
+                manager.update_live_boxes(latest)
+                release.set()
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(manager.session["force_analysis"])
+                manager._maybe_analyze(force=False)
+            self.assertEqual(calls[1][0]["id"], "live")
+            self.assertEqual(calls[1][0]["notes"], "Updated while the old request was running.")
+            self.assertEqual(set(manager.session["analyses"]), {"live"})
+
+    def test_box_edits_during_audio_finalization_are_analyzed_before_final_analysis(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            manager, chunks = make_manager(root, "test-finalize-live-card-race")
+            write_chunk(chunks / "chunk_000000.wav")
+            manager.stop_requested = True
+            manager._load_whisper = lambda *_args: object()
+            manager._transcribe_chunk = lambda *_args: ([{"start": 0, "end": 1, "text": "A deadline is pending."}], "pt")
+            finalize_started, allow_finalize = threading.Event(), threading.Event()
+            def block_finalize():
+                finalize_started.set()
+                self.assertTrue(allow_finalize.wait(3))
+                pathlib.Path(manager.session["audio_file"]).write_bytes(b"final audio")
+            manager._finalize_audio = block_finalize
+            calls = []
+            def fake_live(_port, _model, _transcript, boxes, _summary, _state=None):
+                calls.append([dict(box) for box in boxes])
+                return "Summary", {box["id"]: "Result" for box in boxes}
+            with (patch.object(app, "_ollama_call", side_effect=fake_live),
+                  patch.object(app, "_ollama_final_call", return_value={"summary": "Final", "tasks": [], "results": {}, "updated_at": "test"})):
+                worker = threading.Thread(target=manager._processing_loop, daemon=True)
+                worker.start()
+                self.assertTrue(finalize_started.wait(3))
+                latest = [{"id": "final_risk", "title": "Risk", "prompt": "Identify remaining risk.",
+                           "notes": "Check the pending deadline.", "enabled": True}]
+                manager.update_live_boxes(latest)
+                allow_finalize.set()
+                worker.join(5)
+            self.assertFalse(worker.is_alive())
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertEqual(calls[-1][0]["id"], "final_risk")
+            self.assertEqual(calls[-1][0]["notes"], "Check the pending deadline.")
+            self.assertEqual(manager.session["state"], "completed")
+
     def test_analysis_runs_when_interval_is_due_and_not_twice_for_same_text(self):
         with tempfile.TemporaryDirectory() as td:
             manager, _ = make_manager(pathlib.Path(td), "test-analysis-cadence")

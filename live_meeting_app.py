@@ -37,6 +37,7 @@ MAX_AUDIO_UPLOAD_BYTES = 250 * 1024 * 1024
 RESOURCE_SAMPLE_INTERVAL_SECONDS = 5
 MAX_BOXES = 50
 MAX_PROMPT_CHARS = 2000
+MAX_NOTES_CHARS = 2000
 LIVE_ANALYSIS_MAX_CONTEXT_TOKENS = 65536
 LIVE_ANALYSIS_CONTEXT_RESERVE_TOKENS = 512
 LIVE_ANALYSIS_RESULT_CHARS = 1200
@@ -106,8 +107,8 @@ def normalize_final_config(raw) -> dict:
 
 
 def normalize_boxes(raw_boxes) -> list[dict]:
-    if not isinstance(raw_boxes, list) or not 1 <= len(raw_boxes) <= MAX_BOXES:
-        raise ValueError(f"Configure de 1 a {MAX_BOXES} caixas de análise.")
+    if not isinstance(raw_boxes, list) or not 0 <= len(raw_boxes) <= MAX_BOXES:
+        raise ValueError(f"Configure até {MAX_BOXES} caixas de análise.")
     result, seen = [], set()
     for item in raw_boxes:
         if not isinstance(item, dict):
@@ -122,12 +123,13 @@ def normalize_boxes(raw_boxes) -> list[dict]:
         if not isinstance(prompt, str) or not prompt.strip() or len(prompt.strip()) > MAX_PROMPT_CHARS:
             raise ValueError(f"O prompt deve ter de 1 a {MAX_PROMPT_CHARS} caracteres.")
         enabled = item.get("enabled", True)
+        notes = item.get("notes", "")
         if not isinstance(enabled, bool):
             raise ValueError("O campo enabled deve ser booleano.")
-        result.append({"id": ident, "title": title.strip(), "prompt": prompt.strip(), "enabled": enabled})
+        if not isinstance(notes, str) or len(notes.strip()) > MAX_NOTES_CHARS:
+            raise ValueError(f"As observações devem ter até {MAX_NOTES_CHARS} caracteres.")
+        result.append({"id": ident, "title": title.strip(), "prompt": prompt.strip(), "notes": notes.strip(), "enabled": enabled})
         seen.add(ident)
-    if not any(box["enabled"] for box in result):
-        raise ValueError("Ative pelo menos uma caixa de análise.")
     return result
 
 
@@ -581,12 +583,13 @@ def _ollama_call(port: int, model: str, transcript: str, boxes: list[dict], prev
     system = ("Você é um assistente privado para reuniões. Responda em português brasileiro e use somente fatos da transcrição completa fornecida. "
               "O contexto contém a transcrição integral enquanto ela cabe no orçamento medido; acima dele contém um resumo cumulativo do histórico anterior e a transcrição bruta mais recente. Considere ambos; não trate como pendente algo concluído, rejeitado ou resolvido. Não apresente inferência como decisão. "
               "Atualize o resumo cumulativo de forma concisa, preservando decisões, datas/prazos citados, responsáveis e pontos ainda em aberto; diferencie propostas de decisões e não invente fatos. "
-              "Siga cada prompt de caixa considerando a reunião completa. Mantenha cada resultado direto e útil, com no máximo 1200 caracteres; não copie a transcrição. "
+              "Siga cada prompt de caixa considerando a reunião completa e use as observações do usuário como orientação, nunca como evidência de fatos não presentes na transcrição. Mantenha cada resultado direto e útil, com no máximo 1200 caracteres; não copie a transcrição. "
         "O resumo do histórico é uma síntese e pode não conter cada frase; não alegue certeza sobre detalhes ausentes e use a transcrição bruta recente literalmente. "
               "Retorne somente JSON válido, com exatamente as chaves summary e results. summary deve ter até 2200 caracteres; results deve conter exatamente um objeto id/text por caixa. Sem chaves extras.")
     context, context_mode = _build_analysis_context(port, model, transcript, compaction_state=compaction_state)
     user = json.dumps({"modo_de_contexto": context_mode, "contexto_reuniao": context,
-                       "caixas": [{"id": b["id"], "titulo": b["title"], "prompt": b["prompt"]} for b in boxes]}, ensure_ascii=False)
+                       "caixas": [{"id": b["id"], "titulo": b["title"], "prompt": b["prompt"],
+                                  "observacoes_do_usuario": b.get("notes", "")} for b in boxes]}, ensure_ascii=False)
     num_predict = min(2200, 1000 + 350 * max(0, len(boxes) - 1))
     num_ctx = _live_analysis_num_ctx(user, system, num_predict)
     payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -1060,6 +1063,27 @@ class MeetingManager:
                 self._persist()
         return self.status()
 
+    def update_live_boxes(self, raw_boxes):
+        cards = normalize_boxes(raw_boxes)
+        with self.lock:
+            s = self.session
+            if not s or s.get("state") not in {"recording", "processing"}:
+                raise RuntimeError("As caixas só podem ser alteradas durante uma reunião ativa.")
+            if cards == s.get("cards"):
+                return self.status()
+            old_by_id = {box["id"]: box for box in s.get("cards", [])}
+            new_by_id = {box["id"]: box for box in cards}
+            s["analyses"] = {
+                ident: result for ident, result in s.get("analyses", {}).items()
+                if ident in new_by_id and old_by_id.get(ident) == new_by_id[ident] and new_by_id[ident]["enabled"]
+            }
+            s["cards"] = cards
+            s["analysis_revision"] = s.get("analysis_revision", 0) + 1
+            s["force_analysis"] = bool(s.get("segments"))
+            self._last_analysis_error = ""
+            self._persist()
+        return self.status()
+
     def analyze_now(self):
         with self.lock:
             if not self.session or not self.session["segments"]:
@@ -1144,18 +1168,22 @@ class MeetingManager:
     def _maybe_analyze(self, force: bool = False, model=None):
         with self.lock:
             s = self.session
-            if not s or not s["segments"] or len(s["segments"]) <= self._last_analyzed_segment_count:
+            if not s or not s["segments"]:
+                return model
+            force_requested = force or s.get("force_analysis", False)
+            if len(s["segments"]) <= self._last_analyzed_segment_count and not force_requested:
                 return model
             elapsed = max(0, time.monotonic() - s["started_monotonic"])
-            due = force or s.get("force_analysis", False) or elapsed - s.get("last_analysis_elapsed", 0) >= s["analysis_interval_s"]
+            due = force_requested or elapsed - s.get("last_analysis_elapsed", 0) >= s["analysis_interval_s"]
             if not due:
                 return model
             transcript = "\n".join(str(x.get("text", "")).strip() for x in s["segments"] if str(x.get("text", "")).strip())
             summary_candidate = ""
-            cards = list(s["cards"])
+            cards = [dict(box) for box in s["cards"]]
             context_compaction = s.setdefault("context_compaction", {})
             port, llm_model = s["ollama_port"], s["llm_model"]
             target_segments = len(s["segments"])
+            analysis_revision = s.get("analysis_revision", 0)
             s["force_analysis"] = False
         if model is not None:
             del model
@@ -1173,9 +1201,14 @@ class MeetingManager:
                         if attempt:
                             raise
                 collected.update(batch_results)
+                with self.lock:
+                    if self.session is not s or s.get("analysis_revision", 0) != analysis_revision:
+                        if self.session is s:
+                            s["force_analysis"] = True
+                        return model
 
             with self.lock:
-                if self.session is s:
+                if self.session is s and s.get("analysis_revision", 0) == analysis_revision:
                     for ident, text in collected.items():
                         s["analyses"][ident] = {"text": text, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"), "segment_count": target_segments}
                     s["analysis_summary"] = summary_candidate
@@ -1183,15 +1216,20 @@ class MeetingManager:
                     self._last_analyzed_segment_count = target_segments
                     self._last_analysis_error = ""
                     self._persist()
+                elif self.session is s:
+                    s["force_analysis"] = True
         except Exception as exc:
             with self.lock:
-                if isinstance(exc, LiveAnalysisContextTooLong):
-                    self._last_analysis_error = f"Análise ao vivo não executada: {exc} A transcrição foi preservada sem alterações."
-                else:
-                    detail = "resposta estruturada do modelo inválida" if isinstance(exc, ValueError) else type(exc).__name__
-                    self._last_analysis_error = f"Análise local indisponível após uma nova tentativa: {detail}. A transcrição continua sendo salva."
-                if self.session:
-                    self.session["last_analysis_elapsed"] = elapsed
+                if self.session is s and s.get("analysis_revision", 0) != analysis_revision:
+                    s["force_analysis"] = True
+                    return model
+                if self.session is s:
+                    if isinstance(exc, LiveAnalysisContextTooLong):
+                        self._last_analysis_error = f"Análise ao vivo não executada: {exc} A transcrição foi preservada sem alterações."
+                    else:
+                        detail = "resposta estruturada do modelo inválida" if isinstance(exc, ValueError) else type(exc).__name__
+                        self._last_analysis_error = f"Análise local indisponível após uma nova tentativa: {detail}. A transcrição continua sendo salva."
+                    s["last_analysis_elapsed"] = elapsed
                     self._persist()
         return model
 
@@ -1303,6 +1341,11 @@ class MeetingManager:
                         self._persist()
                     model = self._maybe_analyze(force=False, model=model)
                     continue
+                with self.lock:
+                    reanalyze_requested = self.session is s and s.get("force_analysis", False) and bool(s.get("segments"))
+                if reanalyze_requested:
+                    model = self._maybe_analyze(force=False, model=model)
+                    continue
                 if not recording_alive and stop_requested and next_index > current_max:
                     model = self._maybe_analyze(force=True, model=model)
                     if model is not None:
@@ -1310,13 +1353,19 @@ class MeetingManager:
                         model = None
                         gc.collect()
                     self._finalize_audio()
-                    with self.lock:
-                        if self.session is s:
+                    while True:
+                        model = self._maybe_analyze(force=False, model=model)
+                        with self.lock:
+                            if self.session is not s:
+                                return
+                            if s.get("force_analysis", False):
+                                continue
                             s["state"] = "final_analysis"
                             s["final_analysis_state"] = "running"
                             s["final_analysis_error"] = ""
                             s["elapsed_s"] = max(0, time.monotonic() - s["started_monotonic"])
                             self._persist()
+                            break
                     self._run_final_analysis(s)
                     return
                 if not recording_alive and not stop_requested:
@@ -1576,6 +1625,10 @@ def make_handler(manager: MeetingManager):
                     self._send(200, manager.stop())
                 elif self.path == "/api/analyze":
                     self._send(202, manager.analyze_now())
+                elif self.path == "/api/live-boxes":
+                    if set(payload) != {"boxes"}:
+                        raise ValueError("Envie somente o campo boxes para atualizar as análises ao vivo.")
+                    self._send(200, manager.update_live_boxes(payload["boxes"]))
                 elif self.path == "/api/upload-config":
                     self._send(201, manager.prepare_file_upload(payload))
                 elif self.path == "/api/open/transcript":
