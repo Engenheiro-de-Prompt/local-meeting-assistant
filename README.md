@@ -7,10 +7,10 @@ A desktop-friendly, local-first meeting recorder with incremental transcription 
 ## Features
 
 - Start/stop local capture (microphone, system audio, or both).
-- Incremental transcription with a cached Faster-Whisper model.
-- Configurable live analysis cards sent to a local Ollama model; Gemma 4 E4B is the local setup's default, but any installed model may be selected.
+- Incremental transcription with a cached Faster-Whisper model; the user can transcribe live, defer all transcription until capture stops, or disable transcription for recording-only sessions.
+- Independent switches for live and final analysis with a local Ollama model; Gemma 4 E4B is the local setup's default, but any installed model may be selected. The legacy/default setup keeps all features enabled.
 - Live and final analysis use the full transcript until a conservative estimated context budget is crossed (checked against Ollama prompt metrics when available); then older text is added to a persisted cumulative summary and the newest, not-yet-summarized transcript remains verbatim after it. The original transcript is always retained in full.
-- After stopping, the complete transcription is saved first, then final LLM analysis produces a meeting summary, a structured/sorted task table, and optional custom analysis cards.
+- After stopping, the full transcription is saved first (when enabled); final LLM analysis can then produce a meeting summary, structured/sorted task table, and optional custom analysis cards.
 - Final summary/task prompts and custom final-analysis cards are editable in the dashboard; the combined TXT export puts summary, tasks and custom findings before the full transcript.
 - Dark dashboard, transcript/analysis downloads, copy/open/playback, and local audio-file import.
 - Local-only HTTP service bound to loopback; bounded sequential work and private-per-user output permissions.
@@ -18,8 +18,7 @@ A desktop-friendly, local-first meeting recorder with incremental transcription 
 ## Requirements
 
 - Linux with Python 3.10+, FFmpeg, and PulseAudio/PipeWire-Pulse for live capture.
-- Faster-Whisper installed in the selected Python environment; a Whisper model already present in the local Hugging Face cache.
-- Ollama running on `127.0.0.1:11434` or `127.0.0.1:11435`, with at least one local model installed.
+- Faster-Whisper and a local cached Whisper model when transcription is enabled; Ollama with an installed local model when live or final LLM analysis is enabled.
 - NVIDIA CUDA is optional; CPU transcription is supported when the installed CTranslate2 build supports it.
 
 The project never downloads model weights at runtime. The launcher sets Hugging Face offline mode.

@@ -6,6 +6,17 @@ HTML = (ROOT / "web" / "index.html").read_text(encoding="utf-8")
 
 
 class DashboardFeatureTests(unittest.TestCase):
+    def test_ai_resource_controls_are_available_and_sent_for_live_and_uploaded_audio(self):
+        for element_id in ("transcriptionMode", "liveAnalysisEnabled", "finalAnalysisEnabled"):
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', HTML)
+        self.assertIn('value="after_meeting"', HTML)
+        self.assertIn('value="off"', HTML)
+        self.assertIn("transcription_mode:$('transcriptionMode').value", HTML)
+        self.assertIn("live_analysis_enabled:$('liveAnalysisEnabled').checked", HTML)
+        self.assertIn("final_analysis_enabled:$('finalAnalysisEnabled').checked", HTML)
+        self.assertIn("transcription_mode:$('transcriptionMode').value", HTML.split("async function importAudio", 1)[1])
+
     def test_analysis_panel_precedes_the_secondary_configuration_grid(self):
         self.assertLess(HTML.index('id="analysisPanel"'), HTML.index('<div class="grid">'))
 

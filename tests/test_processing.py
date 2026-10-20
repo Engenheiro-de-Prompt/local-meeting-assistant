@@ -39,6 +39,104 @@ def write_chunk(path):
 
 
 class ProcessingLoopTests(unittest.TestCase):
+    def test_live_analysis_off_never_calls_ollama(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager, _ = make_manager(pathlib.Path(td), "test-live-analysis-off")
+            manager.session.update({"live_analysis_enabled": False,
+                                    "segments": [{"start": 0, "end": 1, "text": "Keep this transcript."}]})
+            with patch.object(app, "_ollama_call") as ollama:
+                manager._maybe_analyze(force=True)
+            ollama.assert_not_called()
+            self.assertEqual(manager.session["analyses"], {})
+            self.assertEqual(manager.session["segments"][0]["text"], "Keep this transcript.")
+
+    def test_after_meeting_mode_defers_whisper_until_capture_stops_then_skips_disabled_final_llm(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager, chunks = make_manager(pathlib.Path(td), "test-delayed-transcription")
+            manager.session.update({"transcription_mode": "after_meeting", "live_analysis_enabled": False,
+                                    "final_analysis_enabled": False})
+            write_chunk(chunks / "chunk_000000.wav")
+
+            class Recorder:
+                alive = True
+                def poll(self):
+                    return None if self.alive else 0
+
+            recorder = Recorder()
+            manager.recorder = recorder
+            manager.stop_requested = False
+            calls = []
+            manager._load_whisper = lambda *_args: object()
+            manager._transcribe_chunk = lambda *_args: (calls.append("transcribed") or
+                ([{"start": 0, "end": 1, "text": "Delayed transcript."}], "pt"))
+            manager._finalize_audio = lambda: None
+            worker = threading.Thread(target=manager._processing_loop, args=(manager.session,), daemon=True)
+            worker.start()
+            try:
+                time.sleep(0.15)
+                self.assertEqual(calls, [], "Whisper must stay unloaded while the meeting is being recorded")
+            finally:
+                recorder.alive = False
+                with manager.lock:
+                    manager.stop_requested = True
+                    manager.session["state"] = "processing"
+                worker.join(timeout=5)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(calls, ["transcribed"])
+            self.assertEqual(manager.session["segments"][0]["text"], "Delayed transcript.")
+            self.assertEqual(manager.session["state"], "completed")
+            self.assertEqual(manager.session["final_analysis_state"], "skipped")
+
+    def test_delayed_transcription_runs_only_final_llm_after_all_transcript_is_ready(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager, chunks = make_manager(pathlib.Path(td), "test-delayed-final-analysis")
+            manager.session.update({"transcription_mode": "after_meeting", "live_analysis_enabled": False,
+                                    "final_analysis_enabled": True})
+            manager.stop_requested = True
+            write_chunk(chunks / "chunk_000000.wav")
+            manager._load_whisper = lambda *_args: object()
+            manager._transcribe_chunk = lambda *_args: ([{"start": 0, "end": 1, "text": "Full deferred transcript."}], "pt")
+            manager._finalize_audio = lambda: None
+            final_inputs = []
+            result = {"summary": "Processed after transcription.", "tasks": [], "results": {}, "updated_at": "test"}
+            with (patch.object(app, "_ollama_call") as live_llm,
+                  patch.object(app, "_ollama_final_call", side_effect=lambda _port, _model, transcript, *_args: final_inputs.append(transcript) or result)):
+                manager._processing_loop(manager.session)
+            live_llm.assert_not_called()
+            self.assertEqual(final_inputs, ["Full deferred transcript."])
+            self.assertEqual(manager.session["final_analysis_state"], "completed")
+            self.assertEqual(manager.session["final_analysis"]["summary"], "Processed after transcription.")
+
+    def test_final_analysis_off_skips_ollama_but_completes_the_session(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager, _ = make_manager(pathlib.Path(td), "test-final-analysis-off")
+            manager.session.update({"final_analysis_enabled": False,
+                                    "segments": [{"start": 0, "end": 1, "text": "Saved transcript."}],
+                                    "final_analysis_state": "running", "state": "final_analysis"})
+            with patch.object(app, "_ollama_final_call") as ollama:
+                manager._run_final_analysis(manager.session)
+            ollama.assert_not_called()
+            self.assertEqual(manager.session["final_analysis_state"], "skipped")
+            self.assertEqual(manager.session["state"], "completed")
+
+    def test_recording_only_skips_whisper_and_llm_but_keeps_final_audio(self):
+        with tempfile.TemporaryDirectory() as td:
+            manager, chunks = make_manager(pathlib.Path(td), "test-record-only")
+            manager.session.update({"transcription_mode": "off", "live_analysis_enabled": False,
+                                    "final_analysis_enabled": False})
+            manager.stop_requested = True
+            write_chunk(chunks / "chunk_000000.wav")
+            with (patch.object(manager, "_load_whisper", side_effect=AssertionError("Whisper should be skipped")),
+                  patch.object(app, "_ollama_call") as live_llm,
+                  patch.object(app, "_ollama_final_call") as final_llm):
+                manager._processing_loop(manager.session)
+            live_llm.assert_not_called()
+            final_llm.assert_not_called()
+            self.assertTrue(pathlib.Path(manager.session["audio_file"]).is_file())
+            self.assertEqual(manager.session["state"], "completed")
+            self.assertEqual(manager.session["segments"], [])
+            self.assertEqual(manager.session["final_analysis_state"], "skipped")
+
     def test_updated_live_cards_are_used_on_the_next_request_and_removed_results_disappear(self):
         with tempfile.TemporaryDirectory() as td:
             manager, _ = make_manager(pathlib.Path(td), "test-live-card-update")

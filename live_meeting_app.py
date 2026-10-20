@@ -71,6 +71,24 @@ def default_final_config() -> dict:
     }
 
 
+def normalize_processing_options(request: dict) -> dict:
+    mode = request.get("transcription_mode", "live")
+    if mode not in ("live", "after_meeting", "off"):
+        raise ValueError("Modo de transcrição inválido.")
+    options: dict[str, object] = {"transcription_mode": mode}
+    for key in ("live_analysis_enabled", "final_analysis_enabled"):
+        value = request.get(key, True)
+        if not isinstance(value, bool):
+            raise ValueError(f"O campo {key} deve ser booleano.")
+        options[key] = value
+    return options
+
+
+def processing_needs_llm(options: dict) -> bool:
+    mode = options["transcription_mode"]
+    return (mode == "live" and options["live_analysis_enabled"]) or (mode != "off" and options["final_analysis_enabled"])
+
+
 def normalize_final_config(raw) -> dict:
     defaults = default_final_config()
     if raw is None:
@@ -676,6 +694,9 @@ class MeetingManager:
                     "started_monotonic": time.monotonic() - elapsed, "elapsed_s": elapsed,
                     "segments": segments, "next_chunk": int(data.get("next_chunk", math.ceil(elapsed / DEFAULT_CHUNK_SECONDS))),
                     "chunk_seconds": DEFAULT_CHUNK_SECONDS, "capture_mode": data.get("capture_mode", "both"),
+                    "transcription_mode": data.get("transcription_mode", "live"),
+                    "live_analysis_enabled": data.get("live_analysis_enabled", True),
+                    "final_analysis_enabled": data.get("final_analysis_enabled", True),
                     "source_filename": data.get("source_filename", ""), "whisper_model": data.get("whisper_model", "small"),
                     "whisper_device": data.get("whisper_device", "cpu"), "llm_model": data.get("llm_model", DEFAULT_LLM_MODEL),
                     "ollama_port": int(data.get("ollama_port", DEFAULT_OLLAMA_PORT)),
@@ -787,6 +808,7 @@ class MeetingManager:
             if not s:
                 return {"state": "idle", "elapsed_s": 0, "transcript": "", "analyses": {}, "cards": default_boxes(), "error": "",
                         "ollama_port": DEFAULT_OLLAMA_PORT, "model": DEFAULT_LLM_MODEL, "resource_usage": {},
+                        "transcription_mode": "live", "live_analysis_enabled": True, "final_analysis_enabled": True,
                         "final_analysis": {}, "final_analysis_state": "not_run", "final_analysis_error": ""}
             elapsed = s.get("elapsed_s", 0)
             if s["state"] == "recording":
@@ -798,6 +820,9 @@ class MeetingManager:
                     "audio_file": s.get("audio_file", ""), "transcript_file": s.get("transcript_file", ""),
                     "session_id": s["session_id"], "error": s.get("error", "") or self.last_error,
                     "model": s["llm_model"], "ollama_port": s["ollama_port"], "analysis_interval_s": s["analysis_interval_s"],
+                    "transcription_mode": s.get("transcription_mode", "live"),
+                    "live_analysis_enabled": s.get("live_analysis_enabled", True),
+                    "final_analysis_enabled": s.get("final_analysis_enabled", True),
                     "segments_done": s["next_chunk"], "final_analysis": s.get("final_analysis", {}),
                     "final_analysis_config": s.get("final_analysis_config", default_final_config()),
                     "final_analysis_state": s.get("final_analysis_state", "not_run"),
@@ -820,19 +845,22 @@ class MeetingManager:
         return {"11434": _local_ollama_models(11434), "11435": _local_ollama_models(11435)}
 
     def _file_settings(self, request: dict) -> dict:
+        options = normalize_processing_options(request)
         model = request.get("whisper_model", "small")
-        try:
-            find_whisper_snapshot(model)
-        except FileNotFoundError:
-            raise RuntimeError(f"Whisper '{model}' não foi encontrado no cache local configurado em HF_HOME. A importação não foi iniciada.") from None
         device = request.get("whisper_device", "cuda")
+        if options["transcription_mode"] != "off":
+            try:
+                find_whisper_snapshot(model)
+            except FileNotFoundError:
+                raise RuntimeError(f"Whisper '{model}' não foi encontrado no cache local configurado em HF_HOME. A importação não foi iniciada.") from None
         if device not in {"cuda", "cpu"}:
             raise ValueError("Dispositivo Whisper inválido.")
         port = int(request.get("ollama_port", DEFAULT_OLLAMA_PORT))
         if port not in (11434, 11435):
             raise ValueError("Endpoint Ollama deve ser local (11434 ou 11435).")
         llm_model = request.get("llm_model", DEFAULT_LLM_MODEL)
-        if llm_model not in _local_ollama_models(port):
+        needs_llm = processing_needs_llm(options)
+        if needs_llm and llm_model not in _local_ollama_models(port):
             raise ValueError("O modelo LLM não está instalado nesse Ollama local.")
         cards = normalize_boxes(request.get("boxes", default_boxes()))
         final_config = normalize_final_config(request.get("final_analysis_config"))
@@ -841,7 +869,7 @@ class MeetingManager:
             raise ValueError("O intervalo de análise deve ficar entre 60 e 600 segundos.")
         return {"whisper_model": model, "whisper_device": device, "ollama_port": port,
                 "llm_model": llm_model, "analysis_interval_s": interval, "cards": cards,
-                "final_analysis_config": final_config}
+                "final_analysis_config": final_config, **options}
 
     def prepare_file_upload(self, request: dict) -> dict:
         if not self.ffmpeg:
@@ -910,6 +938,9 @@ class MeetingManager:
                     "chunk_seconds": DEFAULT_CHUNK_SECONDS, "segments": [], "next_chunk": 0,
                     "capture_mode": "file_upload", "source_filename": name,
                     "whisper_model": settings["whisper_model"], "whisper_device": settings["whisper_device"],
+                    "transcription_mode": settings["transcription_mode"],
+                    "live_analysis_enabled": settings["live_analysis_enabled"],
+                    "final_analysis_enabled": settings["final_analysis_enabled"],
                     "llm_model": settings["llm_model"], "ollama_port": settings["ollama_port"],
                     "analysis_interval_s": settings["analysis_interval_s"], "cards": settings["cards"],
                     "analysis_summary": "", "analyses": {}, "context_compaction": {}, "last_analysis_elapsed": 0,
@@ -952,9 +983,11 @@ class MeetingManager:
         devices = self.devices()
         if mic not in {d["id"] for d in devices["microphones"]} or pc not in {d["id"] for d in devices["monitors"]}:
             raise ValueError("Selecione dispositivos de áudio disponíveis nesta máquina.")
+        options = normalize_processing_options(request)
         model = request.get("whisper_model", "small")
         try:
-            find_whisper_snapshot(model)
+            if options["transcription_mode"] != "off":
+                find_whisper_snapshot(model)
         except FileNotFoundError:
             raise RuntimeError(f"Whisper '{model}' não foi encontrado no cache local configurado em HF_HOME. A captura não foi iniciada e nenhum áudio foi gravado.") from None
         device = request.get("whisper_device", "cuda")
@@ -964,7 +997,8 @@ class MeetingManager:
         if port not in (11434, 11435):
             raise ValueError("Endpoint Ollama deve ser local (11434 ou 11435).")
         llm_model = request.get("llm_model", DEFAULT_LLM_MODEL)
-        if llm_model not in _local_ollama_models(port):
+        needs_llm = processing_needs_llm(options)
+        if needs_llm and llm_model not in _local_ollama_models(port):
             raise ValueError("O modelo LLM não está instalado nesse Ollama local.")
         cards = normalize_boxes(request.get("boxes", default_boxes()))
         final_config = normalize_final_config(request.get("final_analysis_config"))
@@ -1005,7 +1039,10 @@ class MeetingManager:
                         "started_at": datetime.now().astimezone().isoformat(timespec="seconds"), "started_monotonic": time.monotonic(),
                         "elapsed_s": 0, "segments": [], "next_chunk": 0, "analysis_summary": "", "cards": cards, "analyses": {}, "context_compaction": {},
                         "final_analysis_config": final_config, "final_analysis": {}, "final_analysis_state": "pending", "final_analysis_error": "",
-                        "capture_mode": mode, "whisper_model": model, "whisper_device": device, "llm_model": llm_model,
+                        "capture_mode": mode, "whisper_model": model, "whisper_device": device,
+                        "transcription_mode": options["transcription_mode"],
+                        "live_analysis_enabled": options["live_analysis_enabled"],
+                        "final_analysis_enabled": options["final_analysis_enabled"], "llm_model": llm_model,
                         "ollama_port": port, "analysis_interval_s": interval, "last_analysis_elapsed": 0,
                         "chunk_seconds": DEFAULT_CHUNK_SECONDS}
         atomic_write_json(pathlib.Path(self.session["session_json"]), self._persistable_session())
@@ -1079,15 +1116,17 @@ class MeetingManager:
             }
             s["cards"] = cards
             s["analysis_revision"] = s.get("analysis_revision", 0) + 1
-            s["force_analysis"] = bool(s.get("segments"))
+            s["force_analysis"] = bool(s.get("segments")) and s.get("transcription_mode", "live") == "live" and s.get("live_analysis_enabled", True)
             self._last_analysis_error = ""
             self._persist()
         return self.status()
 
     def analyze_now(self):
         with self.lock:
-            if not self.session or not self.session["segments"]:
+            if not self.session or not self.session.get("segments"):
                 raise RuntimeError("Ainda não há transcrição para analisar.")
+            if self.session.get("transcription_mode", "live") != "live" or not self.session.get("live_analysis_enabled", True):
+                raise RuntimeError("A análise ao vivo está desativada para esta sessão.")
             self.session["force_analysis"] = True
         return {"queued": True}
 
@@ -1122,7 +1161,7 @@ class MeetingManager:
         s = self.session
         if not s:
             return {}
-        return {k: s[k] for k in ("session_id", "state", "started_at", "elapsed_s", "audio_file", "transcript_file", "capture_mode", "source_filename", "whisper_model", "whisper_device", "llm_model", "ollama_port", "analysis_interval_s", "segments", "cards", "analysis_summary", "analyses", "context_compaction", "final_analysis_config", "final_analysis", "final_analysis_state", "final_analysis_error", "next_chunk", "resource_usage", "error") if k in s}
+        return {k: s[k] for k in ("session_id", "state", "started_at", "elapsed_s", "audio_file", "transcript_file", "capture_mode", "source_filename", "whisper_model", "whisper_device", "transcription_mode", "live_analysis_enabled", "final_analysis_enabled", "llm_model", "ollama_port", "analysis_interval_s", "segments", "cards", "analysis_summary", "analyses", "context_compaction", "final_analysis_config", "final_analysis", "final_analysis_state", "final_analysis_error", "next_chunk", "resource_usage", "error") if k in s}
 
     def _persist(self):
         if self.session:
@@ -1133,7 +1172,11 @@ class MeetingManager:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"TRANSCRIÇÃO LOCAL — {self.session['session_id']}\nModelo Whisper: {self.session['whisper_model']}\n\n")
+                f.write(f"TRANSCRIÇÃO LOCAL — {self.session['session_id']}\n")
+                if self.session.get("transcription_mode", "live") == "off":
+                    f.write("Transcrição desativada para esta sessão; o áudio foi mantido.\n\n")
+                else:
+                    f.write(f"Modelo Whisper: {self.session['whisper_model']}\n\n")
                 f.write(transcript)
                 f.write("\n")
                 f.flush()
@@ -1168,7 +1211,7 @@ class MeetingManager:
     def _maybe_analyze(self, force: bool = False, model=None):
         with self.lock:
             s = self.session
-            if not s or not s["segments"]:
+            if not s or not s.get("segments") or not s.get("live_analysis_enabled", True) or s.get("transcription_mode", "live") != "live":
                 return model
             force_requested = force or s.get("force_analysis", False)
             if len(s["segments"]) <= self._last_analyzed_segment_count and not force_requested:
@@ -1265,12 +1308,20 @@ class MeetingManager:
     def _run_final_analysis(self, expected_session: dict):
         with self.lock:
             s = self.session
-            if s is not expected_session:
+            if not s or s is not expected_session:
                 return
             transcript = transcript_text_without_timestamps(s.get("segments", []))
             config = normalize_final_config(s.get("final_analysis_config"))
             port, model = s["ollama_port"], s["llm_model"]
             context_compaction = s.setdefault("context_compaction", {})
+            if not s.get("final_analysis_enabled", True) or s.get("transcription_mode", "live") == "off":
+                s["final_analysis"] = {}
+                s["final_analysis_state"] = "skipped"
+                s["final_analysis_error"] = ""
+                s["state"] = "completed"
+                s["elapsed_s"] = max(0, time.monotonic() - s["started_monotonic"])
+                self._persist()
+                return
         try:
             if transcript:
                 result = _ollama_final_call(port, model, transcript, config, context_compaction)
@@ -1323,7 +1374,18 @@ class MeetingManager:
                         indexed.append((int(match.group(1)), path))
                 current_max = max((i for i, _ in indexed), default=-1)
                 recording_alive = proc is not None and proc.poll() is None
-                ready = [(i, p) for i, p in indexed if i >= next_index and (not recording_alive or i < current_max)]
+                transcription_mode = s.get("transcription_mode", "live")
+                if transcription_mode == "off":
+                    ready = []
+                    if not recording_alive and stop_requested:
+                        next_index = max(next_index, current_max + 1)
+                        with self.lock:
+                            if self.session is s:
+                                s["next_chunk"] = next_index
+                elif transcription_mode == "after_meeting" and recording_alive:
+                    ready = []
+                else:
+                    ready = [(i, p) for i, p in indexed if i >= next_index and (not recording_alive or i < current_max)]
                 if ready:
                     index, path = ready[0]
                     if path.stat().st_size <= 44:
@@ -1342,12 +1404,14 @@ class MeetingManager:
                     model = self._maybe_analyze(force=False, model=model)
                     continue
                 with self.lock:
-                    reanalyze_requested = self.session is s and s.get("force_analysis", False) and bool(s.get("segments"))
+                    reanalyze_requested = (self.session is s and s.get("force_analysis", False) and bool(s.get("segments"))
+                                           and s.get("transcription_mode", "live") == "live" and s.get("live_analysis_enabled", True))
                 if reanalyze_requested:
                     model = self._maybe_analyze(force=False, model=model)
                     continue
                 if not recording_alive and stop_requested and next_index > current_max:
-                    model = self._maybe_analyze(force=True, model=model)
+                    if transcription_mode == "live" and s.get("live_analysis_enabled", True):
+                        model = self._maybe_analyze(force=True, model=model)
                     if model is not None:
                         del model
                         model = None
