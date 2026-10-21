@@ -29,6 +29,13 @@ class DashboardFeatureTests(unittest.TestCase):
             with self.subTest(element_id=element_id):
                 self.assertIn(f'id="{element_id}"', HTML)
 
+    def test_record_only_mode_exposes_its_explanatory_transcript_file(self):
+        paint = HTML.split("function paint(s){", 1)[1].split("\n", 1)[0]
+        self.assertIn("hasTranscriptDocument=!!s.transcript_file&&(hasTranscript||(s.transcription_mode==='off'&&!busy&&hasSession))", paint)
+        self.assertIn("$('downloadTranscript').disabled=!hasTranscriptDocument", paint)
+        self.assertIn("$('openTxt').disabled=!hasTranscriptDocument", paint)
+        self.assertIn("$('copyTranscript').disabled=!s.transcript", paint)
+
     def test_final_analysis_workflow_is_configurable_and_exports_combined_txt(self):
         self.assertGreater(HTML.index('id="finalAnalysisPanel"'), HTML.index('<div class="grid">'))
         for element_id in ("summaryPrompt", "tasksPrompt", "finalBoxes", "addFinalBox", "finalTasksTable", "downloadCombined"):
