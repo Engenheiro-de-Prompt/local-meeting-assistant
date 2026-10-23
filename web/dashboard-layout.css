@@ -1,0 +1,94 @@
+/* Load after the dashboard's existing styles. JS supplies spans/heights only. */
+#dashboard.layout-grid,
+#analyses.layout-grid,
+.final-grid.layout-grid,
+#finalCustomResults.layout-grid {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 12px;
+  align-items: start;
+  min-width: 0;
+}
+.layout-grid > * {
+  min-width: 0;
+  max-width: 100%;
+  grid-column: 1 / -1;
+}
+.layout-grid > .layout-block {
+  position: relative;
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 160px;
+  margin-bottom: 0;
+  padding-bottom: 38px;
+  overflow: auto;
+  overflow-wrap: anywhere;
+}
+.layout-block > * {
+  min-width: 0;
+  max-width: 100%;
+}
+.layout-block .table-scroll {
+  max-width: 100%;
+  overflow: auto;
+}
+.layout-tools {
+  display: flex;
+  align-items: center;
+  grid-column: 1 / -1;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.layout-grip,
+.layout-resize {
+  color: var(--muted, #a0a7a4);
+  background: var(--surface-2, #171a1c);
+  border: 1px solid var(--line, #292e30);
+  border-radius: 7px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  padding: 7px 10px;
+}
+.layout-grip {
+  cursor: grab;
+  user-select: none;
+}
+.layout-grip:active { cursor: grabbing; }
+.layout-block > .layout-resize {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  width: 32px;
+  height: 30px;
+  padding: 4px;
+  cursor: nwse-resize;
+  touch-action: none;
+  user-select: none;
+}
+.layout-grip:focus-visible,
+.layout-resize:focus-visible {
+  outline: 2px solid var(--accent, #78e0b1);
+  outline-offset: 3px;
+}
+#layoutStatus {
+  color: var(--muted, #a0a7a4);
+  font-size: 12px;
+}
+@media (max-width: 760px) {
+  #dashboard.layout-grid,
+  #analyses.layout-grid,
+  .final-grid.layout-grid,
+  #finalCustomResults.layout-grid {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+  .layout-grid > *,
+  .layout-grid > .layout-block {
+    grid-column: 1 / -1 !important;
+    height: auto !important;
+    min-height: 0;
+    max-height: none;
+  }
+  .layout-block > .layout-resize { display: none; }
+}

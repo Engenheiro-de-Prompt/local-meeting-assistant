@@ -8,7 +8,7 @@ Thanks for helping improve the local meeting assistant.
 - Never add meeting recordings, transcripts, analyses, personal credentials, runtime logs, cache/model files, or private evaluation fixtures to Git.
 - Keep the original recorder and unrelated services out of scope.
 - Add a regression test before changing behavior; test with synthetic fixtures where possible.
-- Run the complete unittest suite, Python compile check, JavaScript syntax check, and shell syntax check.
+- Run the complete unittest suite, Python compile check, JavaScript syntax check, and shell syntax check. Dashboard behavior tests require Node.js on PATH; CI uses Node 22 and Python 3.12. Real Chrome persistence/reload tests are opt-in through `MEETING_PLAYWRIGHT_MODULE` (see README) and always use temporary synthetic meetings.
 - Include the exact test commands and distinguish unit tests from real device/model validation.
 
 ## Code organization

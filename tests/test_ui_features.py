@@ -18,7 +18,17 @@ class DashboardFeatureTests(unittest.TestCase):
         self.assertIn("transcription_mode:$('transcriptionMode').value", HTML.split("async function importAudio", 1)[1])
 
     def test_analysis_panel_precedes_the_secondary_configuration_grid(self):
-        self.assertLess(HTML.index('id="analysisPanel"'), HTML.index('<div class="grid">'))
+        self.assertLess(HTML.index('id="analysisPanel"'), HTML.index('id="configPanel"'))
+
+    def test_manual_workspace_is_first_and_separate_from_model_box_context(self):
+        self.assertIn('id="notesPanel"', HTML)
+        self.assertLess(HTML.index('id="notesPanel"'), HTML.index('id="controlPanel"'))
+        self.assertIn('id="resetLayout"', HTML)
+        self.assertIn('src="/manual-notes.js"', HTML)
+        self.assertIn('src="/dashboard-layout.js"', HTML)
+        self.assertIn('manual_notes:globalThis.MeetingNotes?.forStart()', HTML)
+        box_config = HTML.split('function getBoxConfig()', 1)[1].split('\n', 1)[0]
+        self.assertNotIn('manual', box_config)
 
     def test_dashboard_defaults_to_dark_color_scheme(self):
         self.assertRegex(HTML, r"color-scheme\s*:\s*dark")
@@ -37,7 +47,7 @@ class DashboardFeatureTests(unittest.TestCase):
         self.assertIn("$('copyTranscript').disabled=!s.transcript", paint)
 
     def test_final_analysis_workflow_is_configurable_and_exports_combined_txt(self):
-        self.assertGreater(HTML.index('id="finalAnalysisPanel"'), HTML.index('<div class="grid">'))
+        self.assertGreater(HTML.index('id="finalAnalysisPanel"'), HTML.index('id="transcriptPanel"'))
         for element_id in ("summaryPrompt", "tasksPrompt", "finalBoxes", "addFinalBox", "finalTasksTable", "downloadCombined"):
             with self.subTest(element_id=element_id):
                 self.assertIn(f'id="{element_id}"', HTML)
@@ -55,11 +65,13 @@ class DashboardFeatureTests(unittest.TestCase):
         self.assertIn("transcrição completa é preservada", HTML)
         self.assertNotIn("não corta a conversa", HTML)
 
-    def test_live_box_editor_has_notes_and_posts_changes_during_an_active_session(self):
+    def test_live_box_editor_uses_one_shared_context_and_posts_live_changes(self):
         self.assertIn('id="liveBoxStatus"', HTML)
-        self.assertIn("Observações para o LLM", HTML)
+        self.assertEqual(HTML.count('id="meetingContext"'), 1)
+        self.assertIn("compartilhado por todas as caixas ao vivo", HTML)
         self.assertIn("/api/live-boxes", HTML)
-        self.assertIn("notes:b.notes", HTML)
+        self.assertIn("notes:$('meetingContext').value", HTML)
+        self.assertNotIn("Observações para o LLM", HTML)
         self.assertIn("scheduleLiveBoxSave()", HTML)
 
     def test_live_start_keeps_error_visible_and_final_analysis_is_a_busy_state(self):

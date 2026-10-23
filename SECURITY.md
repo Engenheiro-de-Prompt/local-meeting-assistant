@@ -8,7 +8,7 @@ Until a project contact is published, report vulnerabilities privately to the re
 
 ## Sensitive data
 
-Never include real recordings, transcripts, generated meeting analysis, credentials, cookies, private model files, or raw logs in bug reports, commits, CI artifacts, or public issue trackers. Use synthetic examples and redact paths/usernames.
+Never include real recordings, transcripts, generated meeting analysis, manual notes/checklists, browser-storage exports, credentials, cookies, private model files, or raw logs in bug reports, commits, CI artifacts, or public issue trackers. Use synthetic examples and redact paths/usernames.
 
 ## Supported security assumptions
 

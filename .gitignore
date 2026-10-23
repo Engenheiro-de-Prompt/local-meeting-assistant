@@ -25,3 +25,22 @@ Ao_Vivo/
 evidence/
 tests/evaluate_existing_audio.py
 .cache/
+
+# Prevent accidental publication of captures, logs and browser artifacts anywhere
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.webm
+*.mp4
+*.mkv
+*.mov
+*.log
+session.json
+transcript.json
+analyses.json
+final_analysis.json
+playwright-report/
+test-results/

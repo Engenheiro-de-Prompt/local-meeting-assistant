@@ -71,6 +71,30 @@ def default_final_config() -> dict:
     }
 
 
+def normalize_manual_notes(value) -> dict:
+    """Validate local-only human notes; never coerce or silently truncate input."""
+    if not isinstance(value, dict) or set(value) - {"text", "items"}:
+        raise ValueError("Notas manuais devem conter somente text e items.")
+    text, items = value.get("text", ""), value.get("items", [])
+    if not isinstance(text, str) or len(text) > 20000:
+        raise ValueError("O texto das notas manuais deve ter até 20000 caracteres.")
+    if not isinstance(items, list) or len(items) > 100:
+        raise ValueError("O checklist manual deve ter até 100 itens.")
+    normalized, seen = [], set()
+    for item in items:
+        if not isinstance(item, dict) or set(item) != {"id", "text", "checked"}:
+            raise ValueError("Cada item manual deve conter id, text e checked.")
+        item_id = item["id"]
+        if (not isinstance(item_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", item_id)
+                or item_id in seen):
+            raise ValueError("IDs do checklist devem ser únicos, seguros e ter até 80 caracteres.")
+        if not isinstance(item["text"], str) or len(item["text"]) > 500 or type(item["checked"]) is not bool:
+            raise ValueError("Item manual exige texto de até 500 caracteres e checked booleano.")
+        seen.add(item_id)
+        normalized.append({"id": item_id, "text": item["text"], "checked": item["checked"]})
+    return {"text": text, "items": normalized}
+
+
 def normalize_processing_options(request: dict) -> dict:
     mode = request.get("transcription_mode", "live")
     if mode not in ("live", "after_meeting", "off"):
@@ -686,7 +710,12 @@ class MeetingManager:
                 except (TypeError, ValueError):
                     final_config = default_final_config()
                 elapsed = max(0.0, float(data.get("elapsed_s", 0) or 0))
+                manual_notes = normalize_manual_notes(data.get("manual_notes", {}))
+                manual_notes_revision = data.get("manual_notes_revision", 0)
+                if type(manual_notes_revision) is not int or manual_notes_revision < 0:
+                    raise ValueError("Revisão de notas manuais inválida.")
                 self.session = {
+                    "manual_notes": manual_notes, "manual_notes_revision": manual_notes_revision,
                     "session_id": session_id, "state": "completed", "folder": str(folder),
                     "chunks_dir": str(folder / ".chunks"), "session_json": str(metadata_path),
                     "transcript_json": str(folder / "transcript.json"), "audio_file": str(audio_path),
@@ -807,6 +836,7 @@ class MeetingManager:
             s = self.session
             if not s:
                 return {"state": "idle", "elapsed_s": 0, "transcript": "", "analyses": {}, "cards": default_boxes(), "error": "",
+                        "manual_notes": {"text": "", "items": []}, "manual_notes_revision": 0,
                         "ollama_port": DEFAULT_OLLAMA_PORT, "model": DEFAULT_LLM_MODEL, "resource_usage": {},
                         "transcription_mode": "live", "live_analysis_enabled": True, "final_analysis_enabled": True,
                         "final_analysis": {}, "final_analysis_state": "not_run", "final_analysis_error": ""}
@@ -815,6 +845,8 @@ class MeetingManager:
                 elapsed = max(elapsed, time.monotonic() - s["started_monotonic"])
             transcript = "\n".join(f"[{_format_time(x['start'])} --> {_format_time(x['end'])}] {x['text']}" for x in s["segments"])
             return {"state": s["state"], "elapsed_s": int(elapsed), "transcript": transcript,
+                    "manual_notes": normalize_manual_notes(s.get("manual_notes", {})),
+                    "manual_notes_revision": s.get("manual_notes_revision", 0),
                     "analyses": s["analyses"], "cards": s["cards"], "analysis_error": self._last_analysis_error,
                     "resource_usage": s.get("resource_usage", {}),
                     "audio_file": s.get("audio_file", ""), "transcript_file": s.get("transcript_file", ""),
@@ -827,6 +859,26 @@ class MeetingManager:
                     "final_analysis_config": s.get("final_analysis_config", default_final_config()),
                     "final_analysis_state": s.get("final_analysis_state", "not_run"),
                     "final_analysis_error": s.get("final_analysis_error", "")}
+
+    def update_manual_notes(self, session_id, expected_revision, notes) -> dict:
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id deve identificar a sessão.")
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected_revision deve ser um inteiro não negativo.")
+        normalized = normalize_manual_notes(notes)
+        with self.lock:
+            s = self.session
+            if not s or s.get("session_id") != session_id:
+                raise RuntimeError("A sessão mudou; recarregue as notas manuais.")
+            if s.get("manual_notes_revision", 0) != expected_revision:
+                raise RuntimeError("As notas manuais foram alteradas; recarregue antes de salvar.")
+            updates = {"manual_notes": normalized, "manual_notes_revision": expected_revision + 1}
+            metadata = self._persistable_session()
+            metadata.update(updates)
+            # Persist only metadata; leave transcript, analyses and model scheduling untouched.
+            atomic_write_json(pathlib.Path(s["session_json"]), metadata)
+            s.update(updates)
+            return self.status()
 
     def combined_report(self) -> str:
         with self.lock:
@@ -872,12 +924,14 @@ class MeetingManager:
                 "final_analysis_config": final_config, **options}
 
     def prepare_file_upload(self, request: dict) -> dict:
+        manual_notes = normalize_manual_notes(request.get("manual_notes", {}))
         if not self.ffmpeg:
             raise RuntimeError("FFmpeg não está disponível no PATH.")
         with self.lock:
             if self.session and self.session.get("state") in {"recording", "processing", "final_analysis"}:
                 raise RuntimeError("Finalize a sessão atual antes de transcrever outro arquivo.")
         settings = self._file_settings(request)
+        settings["manual_notes"] = manual_notes
         token = secrets.token_urlsafe(32)
         with self.lock:
             self._upload_config = {"token": token, "settings": settings, "expires_at": time.monotonic() + 120}
@@ -930,6 +984,7 @@ class MeetingManager:
             with self.lock:
                 self.session = {
                     "session_id": session_id, "state": "processing", "folder": str(folder),
+                    "manual_notes": normalize_manual_notes(settings.get("manual_notes", {})), "manual_notes_revision": 0,
                     "chunks_dir": str(chunks), "session_json": str(folder / "session.json"),
                     "transcript_json": str(folder / "transcript.json"),
                     "audio_file": str(output_base.with_suffix(".wav")),
@@ -972,6 +1027,7 @@ class MeetingManager:
             self._start_lock.release()
 
     def _start_session(self, request: dict):
+        manual_notes = normalize_manual_notes(request.get("manual_notes", {}))
         if not self.ffmpeg:
             raise RuntimeError("FFmpeg não está disponível no PATH.")
         with self.lock:
@@ -1033,6 +1089,7 @@ class MeetingManager:
         self._last_analyzed_segment_count = 0
         self._last_analysis_error = ""
         self.session = {"session_id": session_id, "state": "recording", "folder": str(folder), "chunks_dir": str(chunks),
+                        "manual_notes": manual_notes, "manual_notes_revision": 0,
                         "audio_file": str(self.recordings_dir / f"{session_id}.wav"),
                         "transcript_file": str(self.recordings_dir / f"{session_id}.txt"),
                         "session_json": str(folder / "session.json"), "transcript_json": str(folder / "transcript.json"),
@@ -1161,7 +1218,7 @@ class MeetingManager:
         s = self.session
         if not s:
             return {}
-        return {k: s[k] for k in ("session_id", "state", "started_at", "elapsed_s", "audio_file", "transcript_file", "capture_mode", "source_filename", "whisper_model", "whisper_device", "transcription_mode", "live_analysis_enabled", "final_analysis_enabled", "llm_model", "ollama_port", "analysis_interval_s", "segments", "cards", "analysis_summary", "analyses", "context_compaction", "final_analysis_config", "final_analysis", "final_analysis_state", "final_analysis_error", "next_chunk", "resource_usage", "error") if k in s}
+        return {k: s[k] for k in ("session_id", "state", "manual_notes", "manual_notes_revision", "started_at", "elapsed_s", "audio_file", "transcript_file", "capture_mode", "source_filename", "whisper_model", "whisper_device", "transcription_mode", "live_analysis_enabled", "final_analysis_enabled", "llm_model", "ollama_port", "analysis_interval_s", "segments", "cards", "analysis_summary", "analyses", "context_compaction", "final_analysis_config", "final_analysis", "final_analysis_state", "final_analysis_error", "next_chunk", "resource_usage", "error") if k in s}
 
     def _persist(self):
         if self.session:
@@ -1630,6 +1687,13 @@ def make_handler(manager: MeetingManager):
                     self._send(200, index_path.read_bytes(), "text/html; charset=utf-8")
                 except OSError:
                     self.send_error(500)
+            elif self.path in ("/manual-notes.js", "/dashboard-layout.js", "/dashboard-layout.css"):
+                asset = APP_ROOT / "web" / self.path[1:]
+                mime = "text/css; charset=utf-8" if asset.suffix == ".css" else "application/javascript; charset=utf-8"
+                try:
+                    self._send(200, asset.read_bytes(), mime)
+                except OSError:
+                    self._send(404, {"error": "Recurso local não encontrado."})
             elif self.path == "/api/status":
                 self._send(200, manager.status())
             elif self.path == "/api/devices":
@@ -1693,6 +1757,10 @@ def make_handler(manager: MeetingManager):
                     if set(payload) != {"boxes"}:
                         raise ValueError("Envie somente o campo boxes para atualizar as análises ao vivo.")
                     self._send(200, manager.update_live_boxes(payload["boxes"]))
+                elif self.path == "/api/manual-notes":
+                    if set(payload) != {"session_id", "expected_revision", "notes"}:
+                        raise ValueError("Envie somente session_id, expected_revision e notes.")
+                    self._send(200, manager.update_manual_notes(payload["session_id"], payload["expected_revision"], payload["notes"]))
                 elif self.path == "/api/upload-config":
                     self._send(201, manager.prepare_file_upload(payload))
                 elif self.path == "/api/open/transcript":

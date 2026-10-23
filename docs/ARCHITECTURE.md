@@ -3,7 +3,9 @@
 ## Components
 
 - `live_meeting_app.py`: loopback-only HTTP server, session manager, FFmpeg capture/import, incremental Whisper worker, Ollama request/validation, private persistence, and resource samples.
-- `web/index.html`: self-contained dashboard (vanilla HTML/CSS/JS; no external assets).
+- `web/index.html`: vanilla HTML/CSS/JS dashboard; additional assets are served locally through an exact allowlist, without a CDN.
+- `web/manual-notes.js`: manual notes/checklist, per-document draft caches with reload recovery, bounded autosave and explicit revision conflicts. Content stays outside the model context.
+- `web/dashboard-layout.js` and `.css`: move/resize controls, responsive groups and validated browser-local layout preferences.
 - `start.sh`: offline Hugging Face runtime and environment-based local Python/CUDA path setup.
 - `tests/`: unit and HTTP integration tests using temporary directories and synthetic or mocked data.
 

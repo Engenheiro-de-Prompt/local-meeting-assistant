@@ -8,6 +8,7 @@ A desktop-friendly, local-first meeting recorder with incremental transcription 
 
 - Start/stop local capture (microphone, system audio, or both).
 - Incremental transcription with a cached Faster-Whisper model; the user can transcribe live, defer all transcription until capture stops, or disable transcription for recording-only sessions.
+- One shared meeting-context field for all live-analysis cards; each card keeps its own prompt. Context edits are applied to the next live analysis, including newly added cards. Saved per-card notes are merged without duplicates or silent truncation; over-limit merged text must be reviewed before submission.
 - Independent switches for live and final analysis with a local Ollama model; Gemma 4 E4B is the local setup's default, but any installed model may be selected. The legacy/default setup keeps all features enabled.
 - Live and final analysis use the full transcript until a conservative estimated context budget is crossed (checked against Ollama prompt metrics when available); then older text is added to a persisted cumulative summary and the newest, not-yet-summarized transcript remains verbatim after it. The original transcript is always retained in full.
 - After stopping, the full transcription is saved first (when enabled); final LLM analysis can then produce a meeting summary, structured/sorted task table, and optional custom analysis cards.
@@ -45,9 +46,27 @@ python -m py_compile live_meeting_app.py tests/*.py
 bash -n start.sh
 ```
 
+Dashboard behavior tests execute the shipped JavaScript with Node.js (available on PATH); no npm packages are required for these tests.
+
 Tests use synthetic or temporary audio and mocked model outputs; they do not need a real meeting or an Ollama model. Install FFmpeg to run the audio-processing tests.
 
 Context summaries are semantic compression, not a lossless transcript. The original transcript remains the source of truth; automated prompts/tests reduce but cannot eliminate omission risk. See `docs/ARCHITECTURE.md` for the compaction budget and behavior.
+
+## Anotações manuais e organização do dashboard
+
+- O primeiro bloco traz texto livre e checklist: adicione, edite, marque ou remova itens. **Essas anotações não são enviadas ao modelo** nem misturadas ao contexto compartilhado das análises.
+- Antes da gravação, o rascunho fica salvo neste navegador. Ao iniciar a reunião ou importar um áudio com sucesso, ele é associado àquela sessão e salvo no `session.json` local. Edições posteriores são salvas automaticamente. Anotações da reunião anterior não são copiadas para a seguinte: use **Novo rascunho** para preparar a próxima.
+- Mova os blocos pela alça **Mover** e redimensione pelo canto inferior direito. Isso inclui os blocos principais e as caixas individuais de análises ao vivo/finais dentro dos seus respectivos grupos. Pela alça, use ↑/↓ para mover; pelo canto, use setas para largura/altura e Home para altura automática.
+- O layout fica salvo neste navegador, separado das notas. **Restaurar layout padrão** não apaga anotações, contexto nem prompts. Em telas estreitas os blocos ficam empilhados e com altura automática.
+- Se outra aba editar a mesma reunião, a interface exige escolher explicitamente uma versão, sem sobrescrever a edição silenciosamente. Falhas de salvamento aparecem no bloco; mantenha a página aberta se o armazenamento do navegador também estiver indisponível.
+
+Os testes de navegador opcionais usam Chrome e Playwright já instalados, sem baixar dependências. Para a integração de UI → HTTP → arquivo → restauração em diretório temporário:
+
+```bash
+MEETING_PLAYWRIGHT_MODULE=/caminho/para/playwright python3 -m unittest discover -s tests -p test_browser_roundtrip.py -v
+```
+
+O runner `tests/dashboard-workspace.cjs` também testa drag/resize, teclado, layout persistente, polling e viewport estreita; exige `MEETING_TEST_URL` apontando ao servidor de teste e intercepta as APIs com dados sintéticos. Não execute testes de escrita sobre gravações reais. Decisões de escopo: `docs/manual-workspace.md`.
 
 ## Privacy and scope
 

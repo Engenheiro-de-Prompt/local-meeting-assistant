@@ -15,6 +15,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
       - name: Install system test dependency
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Run tests
@@ -23,6 +26,9 @@ jobs:
         run: |
           python -m py_compile live_meeting_app.py tests/*.py
           bash -n start.sh
+          node --check web/manual-notes.js
+          node --check web/dashboard-layout.js
+          for script in tests/*.cjs; do node --check "$script"; done
           python - <<'PY'
           import pathlib, re, subprocess, tempfile
           text = pathlib.Path('web/index.html').read_text(encoding='utf-8')
