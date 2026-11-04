@@ -182,7 +182,13 @@ class PendingResumeTests(unittest.TestCase):
             serving.start()
             calls = []
             try:
-                with (patch.object(manager, '_load_whisper', return_value=object()),
+                # This test verifies checkpoint replay, not the runner's current
+                # pressure. Keep the real guard/monitor with deterministic healthy
+                # telemetry; separate lifecycle tests exercise pressure and cooldowns.
+                healthy = dict(cpu_percent=1, ram_available_mib=9000,
+                               memory_pressure='normal', disk_free_mib=9000, swap_out_mib=0)
+                with (patch.object(app.ResourceSampler, 'collect', return_value=healthy),
+                      patch.object(manager, '_load_whisper', return_value=object()),
                       patch.object(manager, '_transcribe_chunk', side_effect=lambda _m, _p, i, _l:
                                    (calls.append(i) or [{'start': i * 45, 'end': (i + 1) * 45,
                                                         'text': f'Resumed {i}'}], 'pt')),
