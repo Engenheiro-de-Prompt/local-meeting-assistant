@@ -1,0 +1,19 @@
+{
+  "timestamp": "2026-11-03T21:03:13.293643-03:00",
+  "tests_run": 232,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "successful": true,
+  "elapsed_s": 69.29,
+  "chrome_enabled": true,
+  "audio_fault_checks": [
+    "Real synthetic FFmpeg SIGKILL; exact available PCM recovered into new WAV; original chunks unchanged",
+    "Real silent PCM advances during recording-only; sealed chunk journal written; transcription cursor unchanged",
+    "Actual macOS idle-sleep assertion scoped to recorder PID and cleaned after stop"
+  ],
+  "physical_devices_opened": false,
+  "production_recordings_used": false,
+  "power_loss_tested": false,
+  "evidence_scope": "Historical local validation only; rerun the suite for the published revision. Not proof of deployment or performance on other machines."
+}

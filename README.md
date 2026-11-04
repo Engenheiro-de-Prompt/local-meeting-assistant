@@ -2,7 +2,7 @@
 
 A desktop-friendly, local-first meeting recorder with incremental transcription and configurable LLM analysis. Audio and transcripts stay on the machine; LLM requests go only to a local Ollama endpoint.
 
-> **Status:** early, Linux-focused project. Review `SECURITY.md` and `docs/ARCHITECTURE.md` before running or packaging it.
+> **Status:** early project with Linux PulseAudio/PipeWire-Pulse capture and macOS AVFoundation support. Review `SECURITY.md` and `docs/ARCHITECTURE.md` before running or packaging it. Device routing and performance must be validated on your hardware.
 
 ## Features
 
@@ -15,10 +15,13 @@ A desktop-friendly, local-first meeting recorder with incremental transcription 
 - Final summary/task prompts and custom final-analysis cards are editable in the dashboard; the combined TXT export puts summary, tasks and custom findings before the full transcript.
 - Dark dashboard, transcript/analysis downloads, copy/open/playback, and local audio-file import.
 - Local-only HTTP service bound to loopback; bounded sequential work and private-per-user output permissions.
+- Backend resource protection with separate requested/effective AI cadence, cancellable workers, recording-only fallback and pending-work recovery. See `docs/resource-safety-operation.md` for thresholds and limitations.
+- Audio progress monitoring, retained original chunks, periodic synchronization and explicit recovery of interrupted PCM WAV files. See `docs/audio-preservation-scope.md`.
+- Optional Swift/AppKit menu-bar resource monitor on macOS; build and headless tests are documented in `native-monitor/README.md`.
 
 ## Requirements
 
-- Linux with Python 3.10+, FFmpeg, and PulseAudio/PipeWire-Pulse for live capture.
+- Python 3.10+ and FFmpeg. Live capture uses PulseAudio/PipeWire-Pulse on Linux or AVFoundation on macOS. macOS system audio requires a separately installed and routed loopback device such as BlackHole; microphone permission and actual capture must be verified.
 - Faster-Whisper and a local cached Whisper model when transcription is enabled; Ollama with an installed local model when live or final LLM analysis is enabled.
 - NVIDIA CUDA is optional; CPU transcription is supported when the installed CTranslate2 build supports it.
 
@@ -42,7 +45,7 @@ The launcher can use an existing recorder virtual environment when available; ot
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile live_meeting_app.py tests/*.py
+python -m py_compile *.py tests/*.py
 bash -n start.sh
 ```
 

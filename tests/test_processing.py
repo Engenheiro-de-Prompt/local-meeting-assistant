@@ -216,7 +216,8 @@ class ProcessingLoopTests(unittest.TestCase):
                 allow_finalize.set()
                 worker.join(5)
             self.assertFalse(worker.is_alive())
-            self.assertGreaterEqual(len(calls), 2)
+            # Background analysis may coalesce obsolete prompts before they start.
+            self.assertGreaterEqual(len(calls), 1)
             self.assertEqual(calls[-1][0]["id"], "final_risk")
             self.assertEqual(calls[-1][0]["notes"], "Check the pending deadline.")
             self.assertEqual(manager.session["state"], "completed")
@@ -469,7 +470,8 @@ class ProcessingLoopTests(unittest.TestCase):
                 token = manager.prepare_file_upload(request)["token"]
                 manager._load_whisper = lambda *_args: object()
                 manager._transcribe_chunk = lambda _model, _path, index, _language: ([{"start": 0, "end": 0.1, "text": f"local file segment {index}"}], "pt")
-                with (patch.object(app, "_ollama_call", side_effect=lambda _p, _m, _t, boxes, _s, _state=None: ("Local test summary", {b["id"]: "Grounded local result" for b in boxes})),
+                with (patch.object(app.ResourceSampler, "collect", return_value={"cpu_percent": 10, "ram_total_mib": 32768, "ram_available_mib": 12000, "memory_pressure": "normal", "disk_free_mib": 10000, "swap_out_mib": 0}),
+                      patch.object(app, "_ollama_call", side_effect=lambda _p, _m, _t, boxes, _s, _state=None: ("Local test summary", {b["id"]: "Grounded local result" for b in boxes})),
                       patch.object(app, "_ollama_final_call", return_value={"summary": "Uploaded final", "tasks": [], "results": {}, "updated_at": "test"})):
                     result = manager.start_uploaded_file(token, source, "sample.wav")
                     self.assertEqual(result["state"], "processing")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import gc
 import http.client
 import ipaddress
@@ -23,6 +24,10 @@ import wave
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from contextlib import contextmanager, nullcontext
+
+from resource_guard import ResourceGuard, ResourceSampler
+from audio_safety import AudioSafety
 
 APP_ROOT = pathlib.Path(__file__).resolve().parent
 SOURCE_APP = pathlib.Path(os.environ.get("MEETING_AUDIO_SOURCE", pathlib.Path.home() / "GravadorReunioes")).expanduser()
@@ -53,6 +58,139 @@ FINAL_PRIORITIES = ["Máxima", "Alta", "Média", "Baixa", "Não informado"]
 FINAL_URGENCIES = ["Imediata", "Alta", "Normal", "Baixa", "Não informada"]
 BOX_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{1,40}$")
 DEVICE_RE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,256}$")
+_INFERENCE_CONTEXT = threading.local()
+
+
+class InferenceDeferred(RuntimeError):
+    pass
+
+
+# One wall-clock budget for an analysis, including compaction and validation retries.
+LLM_ANALYSIS_DEADLINE_SECONDS = 120
+LLM_CANCEL_POLL_SECONDS = 0.05
+
+
+class InferenceCancelled(InferenceDeferred):
+    """Our HTTP was interrupted; the shared server's release is NOT verified."""
+
+
+@contextmanager
+def _llm_analysis_budget():
+    previous = getattr(_INFERENCE_CONTEXT, "deadline", None)
+    if previous is None:
+        _INFERENCE_CONTEXT.deadline = time.monotonic() + LLM_ANALYSIS_DEADLINE_SECONDS
+    try:
+        yield
+    finally:
+        _INFERENCE_CONTEXT.deadline = previous
+
+
+def _check_llm_budget(check, deadline):
+    if check:
+        check()
+    if deadline is not None and time.monotonic() >= deadline:
+        raise InferenceDeferred("llm_analysis_deadline")
+
+
+def _before_llm_request():
+    _check_llm_budget(getattr(_INFERENCE_CONTEXT, "check", None),
+                      getattr(_INFERENCE_CONTEXT, "deadline", None))
+    _INFERENCE_CONTEXT.request_started = True
+
+
+def _ollama_http_request(port, body, max_bytes):
+    """Interrupt only this client's socket, never manage the shared Ollama server.
+
+    Capture thread-local values on the caller thread. shutdown(SHUT_RDWR) must
+    precede close: close alone does not wake a concurrent buffered response read.
+    Retain the socket before getresponse(), which can detach it for HTTP/1.0.
+    """
+    check = getattr(_INFERENCE_CONTEXT, "check", None)
+    deadline = getattr(_INFERENCE_CONTEXT, "deadline", None)
+    _before_llm_request()
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
+    done = threading.Event()
+    cancelled = []
+    sockets = []
+    response = None
+
+    def interrupt():
+        sock = getattr(conn, "sock", None)
+        if isinstance(sock, socket.socket) and sock not in sockets:
+            sockets.append(sock)
+        for sock in tuple(sockets):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        conn.close()
+
+    def watch():
+        while not done.wait(LLM_CANCEL_POLL_SECONDS):
+            try:
+                _check_llm_budget(check, deadline)
+            except Exception:
+                cancelled.append(InferenceCancelled("llm_http_cancelled_server_release_unverified"))
+                # A connect/request may still be publishing its socket. Keep
+                # interrupting until the caller exits, without an unbounded join.
+                while not done.is_set():
+                    interrupt()
+                    if done.wait(LLM_CANCEL_POLL_SECONDS):
+                        break
+                return
+
+    watcher = threading.Thread(target=watch, daemon=True, name="OllamaHTTPCancellation")
+    watcher.start()
+    try:
+        # HTTPConnection does not publish its socket until connect completes.
+        # Bound that otherwise uncancellable loopback-connect phase separately;
+        # keep the historical 600s read timeout for mock/API compatibility while
+        # the watcher enforces the much smaller shared wall-clock budget.
+        connect = getattr(conn, "connect", None)
+        if callable(connect):
+            remaining = deadline - time.monotonic() if deadline is not None else 1.0
+            conn.timeout = max(0.001, min(1.0, remaining))
+            connect()
+            sock = getattr(conn, "sock", None)
+            if isinstance(sock, socket.socket):
+                sockets.append(sock)
+                sock.settimeout(600)
+        _check_llm_budget(check, deadline)
+        if cancelled:
+            raise cancelled[0]
+        conn.request("POST", "/api/chat", body=body,
+                     headers={"Content-Type": "application/json", "Accept": "application/json"})
+        sock = getattr(conn, "sock", None)
+        if isinstance(sock, socket.socket):
+            sockets.append(sock)
+        response = conn.getresponse()
+        raw = response.read(max_bytes)
+        # Do not commit a result racing a guard transition or elapsed deadline.
+        _check_llm_budget(check, deadline)
+        if cancelled:
+            raise cancelled[0]
+        return response.status, raw
+    except Exception as exc:
+        if cancelled:
+            raise cancelled[0] from exc
+        try:
+            _check_llm_budget(check, deadline)
+        except InferenceDeferred as reason:
+            raise InferenceCancelled("llm_http_cancelled_server_release_unverified") from reason
+        raise
+    finally:
+        done.set()
+        watcher.join(timeout=0.5)
+        # In a cancellation path, shutdown first even if the watcher is still
+        # finishing. Neither this cleanup nor the watcher kills/unloads a model.
+        if cancelled:
+            interrupt()
+        else:
+            conn.close()
+        close_response = getattr(response, "close", None)
+        if callable(close_response):
+            close_response()
 
 
 def default_boxes() -> list[dict]:
@@ -95,10 +233,18 @@ def normalize_manual_notes(value) -> dict:
     return {"text": text, "items": normalized}
 
 
+def normalize_transcription_interval(request: dict) -> int:
+    interval = request.get("transcription_interval_s", 45)
+    if type(interval) is not int or not 10 <= interval <= 3600:
+        raise ValueError("O intervalo de transcrição deve ser inteiro entre 10 e 3600 segundos.")
+    return interval
+
+
 def normalize_processing_options(request: dict) -> dict:
     mode = request.get("transcription_mode", "live")
     if mode not in ("live", "after_meeting", "off"):
         raise ValueError("Modo de transcrição inválido.")
+    normalize_transcription_interval(request)
     options: dict[str, object] = {"transcription_mode": mode}
     for key in ("live_analysis_enabled", "final_analysis_enabled"):
         value = request.get(key, True)
@@ -272,24 +418,36 @@ def _valid_device(value: str) -> bool:
     return isinstance(value, str) and bool(DEVICE_RE.fullmatch(value))
 
 
-def build_ffmpeg_command(ffmpeg: str, mode: str, mic_device: str, pc_device: str, mic_volume: float, pc_volume: float, chunks_pattern: str, chunk_seconds: int) -> list[str]:
+def build_ffmpeg_command(ffmpeg: str, mode: str, mic_device: str, pc_device: str, mic_volume: float, pc_volume: float, chunks_pattern: str, chunk_seconds: int, *, backend: str = "pulse") -> list[str]:
     if mode not in {"both", "mic_only", "pc_only"}:
         raise ValueError("Modo de captura inválido.")
-    if not _valid_device(mic_device) or not _valid_device(pc_device):
+    if backend not in {"pulse", "avfoundation"}:
+        raise ValueError("Backend de captura inválido.")
+    if backend == "avfoundation":
+        selected = ([mic_device] if mode == "mic_only" else [pc_device] if mode == "pc_only" else [mic_device, pc_device])
+        if any(not isinstance(value, str) or not re.fullmatch(r"0|[1-9][0-9]{0,8}", value) for value in selected):
+            raise ValueError("O dispositivo AVFoundation deve ser um ID numérico disponível.")
+    elif not _valid_device(mic_device) or not _valid_device(pc_device):
         raise ValueError("Dispositivo de áudio inválido.")
     if not 10 <= int(chunk_seconds) <= 180:
         raise ValueError("A duração do segmento deve ficar entre 10 e 180 segundos.")
     mic = max(0.1, min(float(mic_volume), 3.0))
     pc = max(0.1, min(float(pc_volume), 3.0))
     cmd = [ffmpeg, "-y", "-nostats", "-loglevel", "warning"]
+    if backend == "avfoundation":
+        mic_device, pc_device = ":" + mic_device, ":" + pc_device
     if mode == "both":
-        cmd += ["-f", "pulse", "-i", mic_device, "-f", "pulse", "-i", pc_device,
+        cmd += ["-f", backend, "-i", mic_device, "-f", backend, "-i", pc_device,
                 "-filter_complex", f"[0:a]volume={mic:.2f},aresample=async=1[a0];[1:a]volume={pc:.2f},aresample=async=1[a1];[a0][a1]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]", "-map", "[aout]"]
     elif mode == "mic_only":
-        cmd += ["-f", "pulse", "-i", mic_device, "-filter_complex", f"[0:a]volume={mic:.2f},aresample=async=1[aout]", "-map", "[aout]"]
+        cmd += ["-f", backend, "-i", mic_device, "-filter_complex", f"[0:a]volume={mic:.2f},aresample=async=1[aout]", "-map", "[aout]"]
     else:
-        cmd += ["-f", "pulse", "-i", pc_device, "-filter_complex", f"[0:a]volume={pc:.2f},aresample=async=1[aout]", "-map", "[aout]"]
-    cmd += ["-c:a", "pcm_s16le", "-ar", "16000", "-f", "segment", "-segment_time", str(int(chunk_seconds)), "-reset_timestamps", "1", "-segment_format", "wav", chunks_pattern]
+        cmd += ["-f", backend, "-i", pc_device, "-filter_complex", f"[0:a]volume={pc:.2f},aresample=async=1[aout]", "-map", "[aout]"]
+    if backend == "avfoundation":
+        # AVFoundation already supplies its own audio clock. Avoid async sample
+        # insertion/dropping; keep the same mono PCM path as the raw-input probe.
+        cmd = [arg.replace(",aresample=async=1", "") for arg in cmd]
+    cmd += ["-ac", "1", "-c:a", "pcm_s16le", "-ar", "16000", "-f", "segment", "-segment_time", str(int(chunk_seconds)), "-reset_timestamps", "1", "-segment_format", "wav", "-segment_format_options", "flush_packets=1", chunks_pattern]
     return cmd
 
 
@@ -316,26 +474,47 @@ def atomic_write_json(path: pathlib.Path, value: dict):
 
 def collect_resource_sample() -> dict:
     sample = {}
-    try:
-        values = {}
-        for line in pathlib.Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
-            if line.startswith(("MemTotal:", "MemAvailable:")):
-                key, raw = line.split(":", 1)
-                values[key] = int(raw.strip().split()[0])
-        if "MemTotal" in values and "MemAvailable" in values:
-            sample["ram_total_mib"] = round(values["MemTotal"] / 1024)
-            sample["ram_available_mib"] = round(values["MemAvailable"] / 1024)
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        result = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
-                                 "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2)
-        if result.returncode == 0 and result.stdout.strip():
-            used, total, utilization = (int(value.strip()) for value in result.stdout.splitlines()[0].split(","))
-            sample.update(gpu_memory_used_mib=used, gpu_memory_total_mib=total,
-                          gpu_utilization_percent=utilization)
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        pass
+    if sys.platform == "darwin":
+        try:
+            total_result = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.memsize"],
+                                          capture_output=True, text=True, timeout=2)
+            vm_result = subprocess.run(["/usr/bin/vm_stat"], capture_output=True, text=True, timeout=2)
+            if total_result.returncode == 0 and vm_result.returncode == 0:
+                total_bytes = int(total_result.stdout.strip())
+                page_match = re.search(r"page size of ([0-9]+) bytes", vm_result.stdout)
+                if page_match is None:
+                    raise ValueError("vm_stat sem tamanho de página")
+                page_size = int(page_match.group(1))
+                pages = {name: int(value) for name, value in
+                         re.findall(r"^(Pages [^:]+):\s*([0-9]+)\.", vm_result.stdout, re.M)}
+                # Approximate reclaimable memory, not macOS memory pressure.
+                available_bytes = sum(pages[name] for name in
+                                      ("Pages free", "Pages inactive", "Pages speculative")) * page_size
+                sample["ram_total_mib"] = round(total_bytes / (1024 * 1024))
+                sample["ram_available_mib"] = round(min(total_bytes, available_bytes) / (1024 * 1024))
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError, KeyError):
+            pass
+    else:
+        try:
+            values = {}
+            for line in pathlib.Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+                if line.startswith(("MemTotal:", "MemAvailable:")):
+                    key, raw = line.split(":", 1)
+                    values[key] = int(raw.strip().split()[0])
+            if "MemTotal" in values and "MemAvailable" in values:
+                sample["ram_total_mib"] = round(values["MemTotal"] / 1024)
+                sample["ram_available_mib"] = round(values["MemAvailable"] / 1024)
+        except (OSError, ValueError, IndexError):
+            pass
+        try:
+            result = subprocess.run(["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu",
+                                     "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                used, total, utilization = (int(value.strip()) for value in result.stdout.splitlines()[0].split(","))
+                sample.update(gpu_memory_used_mib=used, gpu_memory_total_mib=total,
+                              gpu_utilization_percent=utilization)
+        except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+            pass
     try:
         sample["system_load_per_cpu"] = round(os.getloadavg()[0] / max(1, os.cpu_count() or 1), 3)
     except (AttributeError, OSError, ZeroDivisionError):
@@ -346,7 +525,7 @@ def collect_resource_sample() -> dict:
 def merge_resource_sample(current: dict | None, sample: dict) -> dict:
     result = dict(current or {})
     result["sample_count"] = int(result.get("sample_count", 0)) + 1
-    if "ram_total_mib" in sample:
+    if "ram_total_mib" in sample and "ram_available_mib" in sample:
         result["ram_total_mib"] = int(sample["ram_total_mib"])
         available = int(sample.get("ram_available_mib", 0))
         result["ram_available_min_mib"] = min(available, int(result.get("ram_available_min_mib", available)))
@@ -485,28 +664,24 @@ def combined_report_text(session: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+@_llm_analysis_budget()
 def _ollama_json_call(port: int, model: str, system: str, user: str, schema: dict, *, num_ctx: int = 8192, num_predict: int = 2400) -> dict:
+    _before_llm_request()
     payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-               "format": schema, "stream": False, "keep_alive": "15s",
-               "options": {"temperature": 0.1, "num_ctx": num_ctx, "num_predict": num_predict}}
+               "format": schema, "stream": False, "think": False, "keep_alive": "15s",
+               "options": {"temperature": 0.1, "num_ctx": num_ctx, "num_predict": num_predict, "num_thread": 2, "num_gpu": 0}}
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=240)
-    try:
-        conn.request("POST", "/api/chat", body=body, headers={"Content-Type": "application/json", "Accept": "application/json"})
-        response = conn.getresponse()
-        raw = response.read(4 * 1024 * 1024)
-        if response.status != 200:
-            raise RuntimeError(f"Ollama local retornou HTTP {response.status} na análise final.")
-        data = strict_json_loads(raw.decode("utf-8"))
-        observed_prompt_tokens = data.get("prompt_eval_count")
-        if isinstance(observed_prompt_tokens, int) and observed_prompt_tokens + num_predict > num_ctx:
-            raise LiveAnalysisContextTooLong(
-                f"Ollama informou {observed_prompt_tokens:,} tokens de entrada para uma janela de {num_ctx:,}; resposta descartada para evitar análise com contexto truncado."
-            )
-        content = data.get("message", {}).get("content", "")
-        return strict_json_loads(content)
-    finally:
-        conn.close()
+    status, raw = _ollama_http_request(port, body, 4 * 1024 * 1024)
+    if status != 200:
+        raise RuntimeError(f"Ollama local retornou HTTP {status} na análise final.")
+    data = strict_json_loads(raw.decode("utf-8"))
+    observed_prompt_tokens = data.get("prompt_eval_count")
+    if isinstance(observed_prompt_tokens, int) and observed_prompt_tokens + num_predict > num_ctx:
+        raise LiveAnalysisContextTooLong(
+            f"Ollama informou {observed_prompt_tokens:,} tokens de entrada para uma janela de {num_ctx:,}; resposta descartada para evitar análise com contexto truncado."
+        )
+    content = data.get("message", {}).get("content", "")
+    return strict_json_loads(content)
 
 
 def _build_analysis_context(port: int, model: str, transcript: str, *, force: bool = False,
@@ -576,6 +751,7 @@ def _build_analysis_context(port: int, model: str, transcript: str, *, force: bo
     return context, "resumo cumulativo + transcrição bruta recente"
 
 
+@_llm_analysis_budget()
 def _ollama_final_call(port: int, model: str, transcript: str, config: dict, compaction_state: dict | None = None) -> dict:
     if not model or len(model) > 200 or any(ch in model for ch in (chr(10), chr(13), chr(0))):
         raise ValueError("Nome de modelo local inválido.")
@@ -618,6 +794,7 @@ def _live_analysis_num_ctx(user: str, system: str, num_predict: int) -> int:
     return max(4096, math.ceil(estimated_tokens / 1024) * 1024)
 
 
+@_llm_analysis_budget()
 def _ollama_call(port: int, model: str, transcript: str, boxes: list[dict], previous_summary: str = "",
                  compaction_state: dict | None = None) -> tuple[str, dict[str, str]]:
     if not model or len(model) > 200 or any(ch in model for ch in (chr(10), chr(13), chr(0))):
@@ -634,27 +811,26 @@ def _ollama_call(port: int, model: str, transcript: str, boxes: list[dict], prev
                                   "observacoes_do_usuario": b.get("notes", "")} for b in boxes]}, ensure_ascii=False)
     num_predict = min(2200, 1000 + 350 * max(0, len(boxes) - 1))
     num_ctx = _live_analysis_num_ctx(user, system, num_predict)
+    _before_llm_request()
     payload = {"model": model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-               "format": analysis_json_schema(boxes), "stream": False, "keep_alive": "15s",
-               "options": {"temperature": 0.1, "num_ctx": num_ctx, "num_predict": num_predict}}
+               "format": analysis_json_schema(boxes), "stream": False, "think": False, "keep_alive": "15s",
+               "options": {"temperature": 0.1, "num_ctx": num_ctx, "num_predict": num_predict, "num_thread": 2, "num_gpu": 0}}
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=120)
-    try:
-        conn.request("POST", "/api/chat", body=body, headers={"Content-Type": "application/json", "Accept": "application/json"})
-        response = conn.getresponse()
-        raw = response.read(2 * 1024 * 1024)
-        if response.status != 200:
-            raise RuntimeError(f"Ollama local retornou HTTP {response.status}.")
-        data = strict_json_loads(raw.decode("utf-8"))
-        observed_prompt_tokens = data.get("prompt_eval_count")
-        if isinstance(observed_prompt_tokens, int) and observed_prompt_tokens + num_predict > num_ctx:
-            raise LiveAnalysisContextTooLong(
-                f"Ollama informou {observed_prompt_tokens:,} tokens de entrada para uma janela de {num_ctx:,}; resultado descartado para evitar análise com contexto truncado."
-            )
-        content = data.get("message", {}).get("content", "")
-        return parse_analysis_envelope(content, boxes)
-    finally:
-        conn.close()
+    status, raw = _ollama_http_request(port, body, 2 * 1024 * 1024)
+    if status != 200:
+        raise RuntimeError(f"Ollama local retornou HTTP {status}.")
+    data = strict_json_loads(raw.decode("utf-8"))
+    observed_prompt_tokens = data.get("prompt_eval_count")
+    if isinstance(observed_prompt_tokens, int) and observed_prompt_tokens + num_predict > num_ctx:
+        raise LiveAnalysisContextTooLong(
+            f"Ollama informou {observed_prompt_tokens:,} tokens de entrada para uma janela de {num_ctx:,}; resultado descartado para evitar análise com contexto truncado."
+        )
+    content = data.get("message", {}).get("content", "")
+    return parse_analysis_envelope(content, boxes)
+
+
+class AudioCaptureError(RuntimeError):
+    """Safe, actionable capture diagnostics that may be shown to the user."""
 
 
 class MeetingManager:
@@ -675,7 +851,28 @@ class MeetingManager:
         self._upload_config = None
         self._resource_stop = None
         self._resource_thread = None
+        self._resource_session = None
+        self._audio_safety_stop = None
+        self._audio_safety_thread = None
+        self._capture_wake = None
+        # One daemon and one coalesced pending request per manager, never per chunk.
+        self._analysis_condition = threading.Condition(self.lock)
+        self._analysis_thread = None
+        self._analysis_pending = None
+        self._analysis_busy = False
+        self._shutdown_requested = threading.Event()
+        self.resource_guard = ResourceGuard()
+        # Idle/restored sessions do not run inference; activate before any production worker.
+        self.resource_guard.enabled = False
+        self._resource_sampler = ResourceSampler()
+        self._inference_lock = threading.Lock()
+        self._inference_cancel = threading.Event()
+        self._inference_kind = None
+        self._whisper_process = None
+        self._llm_release_state = "not_requested"
         self._restore_latest_completed()
+        if self.session:
+            self.resource_guard.set_recording_only(self.session.get("recording_only", False))
 
     def _restore_latest_completed(self):
         try:
@@ -730,6 +927,7 @@ class MeetingManager:
                     "whisper_device": data.get("whisper_device", "cpu"), "llm_model": data.get("llm_model", DEFAULT_LLM_MODEL),
                     "ollama_port": int(data.get("ollama_port", DEFAULT_OLLAMA_PORT)),
                     "analysis_interval_s": int(data.get("analysis_interval_s", DEFAULT_ANALYSIS_SECONDS)),
+                    "transcription_interval_s": normalize_transcription_interval(data),
                     "cards": cards, "analysis_summary": data.get("analysis_summary", ""), "analyses": analyses,
                     "context_compaction": data.get("context_compaction", {}) if isinstance(data.get("context_compaction"), dict) else {},
                     "final_analysis_config": final_config,
@@ -737,6 +935,7 @@ class MeetingManager:
                     "final_analysis_state": data.get("final_analysis_state", "not_run"),
                     "final_analysis_error": data.get("final_analysis_error", ""),
                     "resource_usage": data.get("resource_usage", {}),
+                    "recording_only": data.get("recording_only", False) is True,
                     "last_analysis_elapsed": elapsed, "force_analysis": False, "error": data.get("error", ""),
                 }
                 self._last_analyzed_segment_count = len(segments)
@@ -775,7 +974,7 @@ class MeetingManager:
         path = self._safe_artifact(kind)
         if path is None:
             raise RuntimeError("O arquivo local desta sessão ainda não está disponível.")
-        opener = shutil.which("xdg-open")
+        opener = shutil.which("open" if sys.platform == "darwin" else "xdg-open")
         if not opener:
             raise RuntimeError("O abridor de arquivos do sistema não está disponível.")
         subprocess.Popen([opener, str(path)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -783,37 +982,205 @@ class MeetingManager:
         return {"status": "opening"}
 
     def _record_resource_sample(self, session: dict, persist: bool = True):
-        sample = collect_resource_sample()
-        if not sample:
-            return
+        pids = [os.getpid()] + [getattr(proc, "pid", None) for proc in (self.recorder, self._whisper_process) if proc is not None]
+        sample = self._resource_sampler.collect(session.get("folder", self.recordings_dir), controlled_pids=pids)
         with self.lock:
             if self.session is not session:
                 return
-            session["resource_usage"] = merge_resource_sample(session.get("resource_usage"), sample)
-            if persist and session["resource_usage"]["sample_count"] % 4 == 0:
-                self._persist()
+            self.resource_guard.update(sample)
+            if not self.resource_guard.allowed("whisper"):
+                self._inference_cancel.set()
+            if not self.resource_guard.allowed("llm") and self._inference_kind == "llm":
+                self._llm_release_state = "cancellation_requested_server_release_unverified"
+            session["resource_latest"] = sample
+            numeric = {key: value for key, value in sample.items() if value is not None}
+            session["resource_usage"] = merge_resource_sample(session.get("resource_usage"), numeric)
+        # Telemetry must never rewrite the growing transcript or wait on inference.
+        if persist and sample.get("disk_free_mib") is not None and sample["disk_free_mib"] < 128 and self._recorder_alive():
+            session["capture_warning"] = "Disco crítico: captura encerrada com segmentos originais preservados."
+            self.stop()
+
+    def _recorder_alive(self):
+        return self.recorder is not None and self.recorder.poll() is None
+
+    def _resource_guard_status(self):
+        s = self.session or {}
+        result = self.resource_guard.snapshot(analysis_interval_s=s.get("analysis_interval_s", DEFAULT_ANALYSIS_SECONDS),
+                                             transcription_interval_s=s.get("transcription_interval_s", DEFAULT_CHUNK_SECONDS))
+        result.update(idle_sleep_assertion="requested" if self._capture_wake is not None and self._capture_wake.poll() is None else "inactive",
+                      audio_safety=dict(s.get("audio_safety", {})), capture_alive=self._recorder_alive(), capture_state="running" if self._recorder_alive() else "stopped",
+                      capture_warning=s.get("capture_warning", ""), processing_error=s.get("processing_error", ""),
+                      deferred_chunks=self._processing_progress(s)["pending_chunk_count"] if self.session else 0,
+                      inference_kind=self._inference_kind, inference_concurrency_limit=1,
+                      whisper_threads=2, whisper_cancel_deadline_s=3,
+                      cpu_attribution="controlled_cpu_percent includes backend, recorder and active Whisper only; 100% per core; Ollama not owned",
+                      llm_release_state=self._llm_release_state,
+                      llm_analysis_deadline_s=LLM_ANALYSIS_DEADLINE_SECONDS,
+                      llm_cancellation_limitation="Only this client's HTTP socket is interrupted on pause/shutdown/deadline. Shared server compute/model release remains unverified; heavy work stays blocked after cancellation. No Ollama process is killed or unloaded.",
+                      results_stale=bool(s.get("analyses")) and not result["llm_allowed"])
+        return result
+
+    def set_resource_guard(self, request):
+        if not isinstance(request, dict) or set(request) != {"recording_only"} or type(request["recording_only"]) is not bool:
+            raise ValueError("Envie somente recording_only booleano.")
+        with self.lock:
+            self.resource_guard.set_recording_only(request["recording_only"])
+            if request["recording_only"]:
+                self._inference_cancel.set()
+                self._analysis_pending = None
+                if self._inference_kind == "llm":
+                    self._llm_release_state = "cancellation_requested_server_release_unverified"
+            if self.session:
+                self.session["recording_only"] = request["recording_only"]
+                atomic_write_json(pathlib.Path(self.session["session_json"]), self._persistable_session())
+        return self.status()
+
+    @contextmanager
+    def _inference(self, kind):
+        if self._shutdown_requested.is_set() or not self.resource_guard.allowed(kind):
+            raise InferenceDeferred(self.resource_guard.snapshot()["reason"])
+        if not self._inference_lock.acquire(blocking=False):
+            raise InferenceDeferred("inference_busy")
+        self._inference_kind = kind
+        self._inference_cancel.clear()
+        def check():
+            if self._shutdown_requested.is_set() or self._inference_cancel.is_set() or not self.resource_guard.allowed(kind):
+                raise InferenceDeferred(self.resource_guard.snapshot()["reason"])
+        previous_deadline = getattr(_INFERENCE_CONTEXT, "deadline", None)
+        try:
+            check()
+            _INFERENCE_CONTEXT.check = check
+            _INFERENCE_CONTEXT.request_started = False
+            if kind == "llm":
+                deadline = time.monotonic() + LLM_ANALYSIS_DEADLINE_SECONDS
+                _INFERENCE_CONTEXT.deadline = min(previous_deadline, deadline) if previous_deadline is not None else deadline
+                _check_llm_budget(check, _INFERENCE_CONTEXT.deadline)
+                self._llm_release_state = "request_in_flight"
+            yield
+            if kind == "llm":
+                _check_llm_budget(check, _INFERENCE_CONTEXT.deadline)
+                self._llm_release_state = "response_completed_model_unload_not_verified"
+        except (InferenceDeferred, OSError, http.client.HTTPException):
+            if kind == "llm" and getattr(_INFERENCE_CONTEXT, "request_started", False):
+                self._llm_release_state = "server_release_unverified"
+                self.resource_guard.fail("llm_server_release_unverified")
+            raise
+        finally:
+            _INFERENCE_CONTEXT.check = None
+            _INFERENCE_CONTEXT.deadline = previous_deadline
+            _INFERENCE_CONTEXT.request_started = False
+            self._inference_kind = None
+            self._inference_lock.release()
+
+    def _start_audio_safety(self, session, monitor=None):
+        # No model/resource sampling or transcript persistence on this worker.
+        if self._audio_safety_thread and self._audio_safety_thread.is_alive():
+            raise RuntimeError("Audio safety worker still active")
+        stop = threading.Event()
+        if monitor is None:
+            monitor = AudioSafety(session["chunks_dir"], started=session["started_monotonic"])
+        recorder = self.recorder
+        pid = getattr(recorder, "pid", None)
+        # Hold only idle system sleep, only while this capture PID lives.
+        # Never change global pmset settings or inhibit manual sleep/lid closure.
+        if sys.platform == "darwin" and type(pid) is int and pid > 1:
+            try:
+                self._capture_wake = subprocess.Popen(
+                    ["/usr/bin/caffeinate", "-i", "-w", str(pid)], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+            except OSError:
+                session["capture_warning"] = "Não foi possível solicitar prevenção de suspensão automática durante a gravação."
+        def run():
+            while True:
+                alive = recorder is not None and recorder.poll() is None
+                if stop.is_set() and alive:
+                    return
+                try:
+                    snapshot = monitor.sample(alive, expected_running=not self.stop_requested)
+                except Exception as exc:
+                    snapshot = {"state": "error", "error": str(exc)[:240],
+                                "warning": "Falha no supervisor de áudio; captura original preservada."}
+                with self.lock:
+                    if self.session is not session:
+                        return
+                    session["audio_safety"] = snapshot
+                    if snapshot.get("warning"):
+                        session["capture_warning"] = snapshot["warning"]
+                    if snapshot["state"] in {"error", "stalled", "lagging"} or (not alive and not self.stop_requested):
+                        self.resource_guard.fail("audio_safety_" + snapshot["state"])
+                        self._inference_cancel.set()
+                    if not alive:
+                        return
+                stop.wait(2)
+        self._audio_safety_stop = stop
+        self._audio_safety_thread = threading.Thread(target=run, name="MeetingAudioSafety", daemon=True)
+        self._audio_safety_thread.start()
+
+    def _stop_audio_safety(self):
+        stop, thread = self._audio_safety_stop, self._audio_safety_thread
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=3)
+        # Retain a still-running worker handle: do not permit duplicate workers.
+        if thread is None or not thread.is_alive():
+            self._audio_safety_stop = self._audio_safety_thread = None
+        helper, self._capture_wake = self._capture_wake, None
+        if helper is not None:
+            if helper.poll() is None:
+                helper.terminate()
+            try:
+                helper.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                helper.kill()
+                helper.wait(timeout=1)
 
     def _resource_monitor_loop(self, session: dict, stop: threading.Event):
         while not stop.wait(RESOURCE_SAMPLE_INTERVAL_SECONDS):
             with self.lock:
-                if self.session is not session or session.get("state") in {"completed", "error"}:
+                if self.session is not session or (session.get("state") in {"completed", "error"} and not self._recorder_alive()):
                     return
-            self._record_resource_sample(session)
+            try:
+                self._record_resource_sample(session)
+                if not self._recorder_alive() and not self.stop_requested and session.get("state") == "recording":
+                    with self.lock:
+                        session["state"] = "error"
+                        session["error"] = str(self._capture_error("O processo de captura encerrou inesperadamente."))
+                        atomic_write_json(pathlib.Path(session["session_json"]), self._persistable_session())
+            except Exception:
+                self.resource_guard.fail("resource_supervisor_error")
+                self._inference_cancel.set()
 
     def _start_resource_monitor(self, session: dict):
         stop = threading.Event()
         with self.lock:
             if self.session is not session:
                 return
+            if self._resource_thread and self._resource_thread.is_alive():
+                if self._resource_session is session and self._resource_stop is not None and not self._resource_stop.is_set():
+                    return  # Resume reuses both the sampler and its guard/cooldowns.
+                raise RuntimeError("Resource monitor still stopping")
             session["resource_usage"] = session.get("resource_usage", {})
             self._resource_stop = stop
-        self._record_resource_sample(session, persist=False)
-        thread = threading.Thread(target=self._resource_monitor_loop, args=(session, stop),
-                                  daemon=True, name="MeetingResourceSampler")
-        self._resource_thread = thread
-        thread.start()
+            if self._resource_session is not session:
+                self.resource_guard = ResourceGuard()
+                self.resource_guard.set_recording_only(session.get("recording_only", False))
+                self._resource_sampler = ResourceSampler()
+            self._resource_session = session
+            if self._llm_release_state == "server_release_unverified":
+                self.resource_guard.fail("llm_server_release_unverified")
+            self._resource_sampler.collect(session.get("folder", self.recordings_dir))
+            self._record_resource_sample(session, persist=False)
+            thread = threading.Thread(target=self._resource_monitor_loop, args=(session, stop),
+                                      daemon=True, name="MeetingResourceSampler")
+            self._resource_thread = thread
+            thread.start()
 
     def _stop_resource_monitor(self, session: dict):
+        with self.lock:
+            if self.session is not session:
+                return
+        self._stop_audio_safety()
         with self.lock:
             if self.session is not session:
                 return
@@ -821,34 +1188,63 @@ class MeetingManager:
         if stop is None:
             return
         stop.set()
-        if thread and thread is not threading.current_thread():
+        if thread and thread is not threading.current_thread() and thread.is_alive():
             thread.join(timeout=3)
         self._record_resource_sample(session, persist=False)
         with self.lock:
             if self.session is session:
-                self._persist()
-            if self._resource_stop is stop:
+                try:
+                    atomic_write_json(pathlib.Path(session["session_json"]), self._persistable_session())
+                except OSError:
+                    self.resource_guard.fail("checkpoint_write_error")
+            # A timed-out join still owns this handle; never orphan a live sampler.
+            if self._resource_stop is stop and (thread is None or not thread.is_alive()):
                 self._resource_stop = None
                 self._resource_thread = None
+
+    def _processing_progress(self, s: dict) -> dict:
+        indices = []
+        chunks_dir = s.get("chunks_dir") or (pathlib.Path(s["folder"]) / ".chunks" if s.get("folder") else None)
+        paths = pathlib.Path(chunks_dir).glob("chunk_*.wav") if chunks_dir else ()
+        for path in paths:
+            match = re.fullmatch(r"chunk_(\d+)\.wav", path.name)
+            if match:
+                indices.append(int(match.group(1)))
+        alive = self.recorder is not None and self.recorder.poll() is None
+        newest = max(indices, default=-1)
+        pending = sum(i >= s["next_chunk"] and (not alive or i < newest) for i in indices)
+        return {"captured_chunk_count": len(indices), "next_chunk": s["next_chunk"],
+                "pending_chunk_count": pending, "open_chunk_count": int(alive and bool(indices)),
+                "caught_up": pending == 0,
+                "transcript_coverage_s": max((x["end"] for x in s["segments"]), default=0),
+                "analysis_busy": self._analysis_busy or s.get("final_analysis_state") == "running",
+                "analysis_pending": self._analysis_pending is not None}
 
     def status(self) -> dict:
         with self.lock:
             s = self.session
             if not s:
-                return {"state": "idle", "elapsed_s": 0, "transcript": "", "analyses": {}, "cards": default_boxes(), "error": "",
+                return {"state": "idle", "pending_final_processing": False, "resource_deferred": False, "processing_worker_alive": bool(self.worker_thread and self.worker_thread.is_alive()), "elapsed_s": 0, "transcript": "", "analyses": {}, "cards": default_boxes(), "error": "",
                         "manual_notes": {"text": "", "items": []}, "manual_notes_revision": 0,
                         "ollama_port": DEFAULT_OLLAMA_PORT, "model": DEFAULT_LLM_MODEL, "resource_usage": {},
+                        "resource_guard": self._resource_guard_status(), "transcription_interval_s": DEFAULT_CHUNK_SECONDS,
                         "transcription_mode": "live", "live_analysis_enabled": True, "final_analysis_enabled": True,
                         "final_analysis": {}, "final_analysis_state": "not_run", "final_analysis_error": ""}
             elapsed = s.get("elapsed_s", 0)
             if s["state"] == "recording":
                 elapsed = max(elapsed, time.monotonic() - s["started_monotonic"])
             transcript = "\n".join(f"[{_format_time(x['start'])} --> {_format_time(x['end'])}] {x['text']}" for x in s["segments"])
-            return {"state": s["state"], "elapsed_s": int(elapsed), "transcript": transcript,
+            return {"state": s["state"], "elapsed_s": int(elapsed),
+                    "resource_deferred": bool(s.get("resource_deferred")),
+                    "pending_final_processing": bool(s.get("resource_deferred")) and s["state"] in {"processing", "final_analysis", "error"},
+                    "processing_worker_alive": bool(self.worker_thread and self.worker_thread.is_alive()), "transcript": transcript,
+                    "processing_progress": self._processing_progress(s),
                     "manual_notes": normalize_manual_notes(s.get("manual_notes", {})),
                     "manual_notes_revision": s.get("manual_notes_revision", 0),
                     "analyses": s["analyses"], "cards": s["cards"], "analysis_error": self._last_analysis_error,
                     "resource_usage": s.get("resource_usage", {}),
+                    "resource_guard": self._resource_guard_status(),
+                    "transcription_interval_s": s.get("transcription_interval_s", DEFAULT_CHUNK_SECONDS),
                     "audio_file": s.get("audio_file", ""), "transcript_file": s.get("transcript_file", ""),
                     "session_id": s["session_id"], "error": s.get("error", "") or self.last_error,
                     "model": s["llm_model"], "ollama_port": s["ollama_port"], "analysis_interval_s": s["analysis_interval_s"],
@@ -890,6 +1286,31 @@ class MeetingManager:
             return combined_report_text(s)
 
     def devices(self):
+        if sys.platform == "darwin":
+            if not self.ffmpeg:
+                raise RuntimeError("FFmpeg não está disponível no PATH.")
+            try:
+                # Listing exits without opening an input (often with a nonzero status).
+                result = subprocess.run(
+                    [self.ffmpeg, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.SubprocessError):
+                raise RuntimeError("Não foi possível listar dispositivos AVFoundation no macOS.") from None
+            mics, monitors = [], []
+            audio_section = False
+            for line in (result.stderr + "\n" + result.stdout).splitlines():
+                if "AVFoundation audio devices:" in line:
+                    audio_section = True
+                    continue
+                if "AVFoundation video devices:" in line:
+                    audio_section = False
+                match = re.search(r"\] \[([0-9]+)\] (.+)$", line) if audio_section else None
+                if match:
+                    ident, name = match.groups()
+                    item = {"id": ident, "name": name, "desc": name}
+                    target = monitors if re.search(r"blackhole|loopback|soundflower", name, re.I) else mics
+                    target.append(item)
+            return {"microphones": mics, "monitors": monitors, "capture_backend": "avfoundation"}
         mics, monitors = _get_devices()
         return {"microphones": mics, "monitors": monitors}
 
@@ -899,7 +1320,7 @@ class MeetingManager:
     def _file_settings(self, request: dict) -> dict:
         options = normalize_processing_options(request)
         model = request.get("whisper_model", "small")
-        device = request.get("whisper_device", "cuda")
+        device = request.get("whisper_device", "cpu" if sys.platform == "darwin" else "cuda")
         if options["transcription_mode"] != "off":
             try:
                 find_whisper_snapshot(model)
@@ -916,11 +1337,12 @@ class MeetingManager:
             raise ValueError("O modelo LLM não está instalado nesse Ollama local.")
         cards = normalize_boxes(request.get("boxes", default_boxes()))
         final_config = normalize_final_config(request.get("final_analysis_config"))
-        interval = int(request.get("analysis_interval_s", DEFAULT_ANALYSIS_SECONDS))
-        if not 60 <= interval <= 600:
+        interval = request.get("analysis_interval_s", DEFAULT_ANALYSIS_SECONDS)
+        if type(interval) is not int or not 60 <= interval <= 600:
             raise ValueError("O intervalo de análise deve ficar entre 60 e 600 segundos.")
         return {"whisper_model": model, "whisper_device": device, "ollama_port": port,
                 "llm_model": llm_model, "analysis_interval_s": interval, "cards": cards,
+                "transcription_interval_s": normalize_transcription_interval(request),
                 "final_analysis_config": final_config, **options}
 
     def prepare_file_upload(self, request: dict) -> dict:
@@ -928,7 +1350,7 @@ class MeetingManager:
         if not self.ffmpeg:
             raise RuntimeError("FFmpeg não está disponível no PATH.")
         with self.lock:
-            if self.session and self.session.get("state") in {"recording", "processing", "final_analysis"}:
+            if self._recorder_alive() or (self.session and self.session.get("state") in {"recording", "processing", "final_analysis"}):
                 raise RuntimeError("Finalize a sessão atual antes de transcrever outro arquivo.")
         settings = self._file_settings(request)
         settings["manual_notes"] = manual_notes
@@ -938,13 +1360,21 @@ class MeetingManager:
         return {"token": token}
 
     def start_uploaded_file(self, token: str, source_path: pathlib.Path, filename: str):
+        if not self._start_lock.acquire(blocking=False):
+            raise RuntimeError("Outra sessão está sendo iniciada.")
+        try:
+            return self._start_uploaded_file(token, source_path, filename)
+        finally:
+            self._start_lock.release()
+
+    def _start_uploaded_file(self, token: str, source_path: pathlib.Path, filename: str):
         with self.lock:
             config = self._upload_config
             if (not config or not isinstance(token, str) or not secrets.compare_digest(token, config["token"])
                     or time.monotonic() > config["expires_at"]):
                 self._upload_config = None
                 raise RuntimeError("Configuração de importação expirada; tente novamente.")
-            if self.session and self.session.get("state") in {"recording", "processing", "final_analysis"}:
+            if self._recorder_alive() or self._inference_kind or (self.session and self.session.get("state") in {"recording", "processing", "final_analysis"}):
                 self._upload_config = None
                 raise RuntimeError("Finalize a sessão atual antes de transcrever outro arquivo.")
             settings = config["settings"]
@@ -969,13 +1399,13 @@ class MeetingManager:
         chunks = folder / ".chunks"
         chunks.mkdir(mode=0o700)
         chunks_pattern = str(chunks / "chunk_%06d.wav")
-        command = [self.ffmpeg, "-y", "-nostats", "-loglevel", "error", "-i", str(source_path),
-                   "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
+        command = [self.ffmpeg, "-y", "-nostats", "-loglevel", "error", "-threads", "1", "-i", str(source_path),
+                   "-map", "0:a:0", "-vn", "-threads", "1", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
                    "-f", "segment", "-segment_time", str(DEFAULT_CHUNK_SECONDS), "-reset_timestamps", "1",
                    "-segment_format", "wav", chunks_pattern]
         try:
-            result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.PIPE, timeout=1800)
+            from import_decode import decode_supervised
+            result = decode_supervised(command, chunks, cancelled=self._shutdown_requested.is_set)
             created_chunks = sorted(chunks.glob("chunk_*.wav"))
             if result.returncode != 0 or not created_chunks or any(p.stat().st_size <= 44 for p in created_chunks):
                 raise RuntimeError("Não foi possível decodificar o arquivo de áudio enviado.")
@@ -994,6 +1424,7 @@ class MeetingManager:
                     "capture_mode": "file_upload", "source_filename": name,
                     "whisper_model": settings["whisper_model"], "whisper_device": settings["whisper_device"],
                     "transcription_mode": settings["transcription_mode"],
+                    "transcription_interval_s": settings.get("transcription_interval_s", DEFAULT_CHUNK_SECONDS),
                     "live_analysis_enabled": settings["live_analysis_enabled"],
                     "final_analysis_enabled": settings["final_analysis_enabled"],
                     "llm_model": settings["llm_model"], "ollama_port": settings["ollama_port"],
@@ -1002,6 +1433,7 @@ class MeetingManager:
                     "final_analysis_config": settings["final_analysis_config"], "final_analysis": {},
                     "final_analysis_state": "pending", "final_analysis_error": "",
                     "force_analysis": False, "error": "",
+                    "recording_only": self.resource_guard.recording_only,
                 }
                 self.recorder = None
                 self.stop_requested = True
@@ -1031,13 +1463,31 @@ class MeetingManager:
         if not self.ffmpeg:
             raise RuntimeError("FFmpeg não está disponível no PATH.")
         with self.lock:
-            if self.session and self.session["state"] in {"recording", "processing", "final_analysis"}:
+            if self._audio_safety_thread and self._audio_safety_thread.is_alive():
+                raise RuntimeError("O supervisor de áudio anterior ainda está encerrando; nenhuma nova captura foi iniciada.")
+            if self._recorder_alive() or self._inference_kind or (self.worker_thread and self.worker_thread.is_alive()) or (self.session and self.session["state"] in {"recording", "processing", "final_analysis"}):
                 raise RuntimeError("Já existe uma reunião ativa ou em análise final.")
+        disk_path = self.recordings_dir
+        while not disk_path.exists() and disk_path.parent != disk_path:
+            disk_path = disk_path.parent
+        try:
+            if shutil.disk_usage(disk_path).free < 512 * 1024 * 1024:
+                raise RuntimeError("Disco sem reserva mínima de 512 MiB; a captura não foi iniciada.")
+        except OSError:
+            raise RuntimeError("Não foi possível verificar a reserva de disco; a captura não foi iniciada.") from None
         mode = request.get("capture_mode", "both")
         mic = request.get("mic_device", "default")
         pc = request.get("pc_device", "@DEFAULT_MONITOR@")
         devices = self.devices()
-        if mic not in {d["id"] for d in devices["microphones"]} or pc not in {d["id"] for d in devices["monitors"]}:
+        backend = devices.get("capture_backend", "pulse")
+        if backend == "avfoundation":
+            if mode in {"both", "pc_only"} and not devices["monitors"]:
+                raise RuntimeError("Áudio do sistema no macOS requer BlackHole ou Loopback (ou Soundflower). Instale e configure o roteamento de áudio antes de capturar; nenhum áudio foi gravado.")
+            invalid = ((mode != "pc_only" and mic not in [d["id"] for d in devices["microphones"]])
+                       or (mode != "mic_only" and pc not in [d["id"] for d in devices["monitors"]]))
+        else:
+            invalid = mic not in {d["id"] for d in devices["microphones"]} or pc not in {d["id"] for d in devices["monitors"]}
+        if invalid:
             raise ValueError("Selecione dispositivos de áudio disponíveis nesta máquina.")
         options = normalize_processing_options(request)
         model = request.get("whisper_model", "small")
@@ -1046,7 +1496,7 @@ class MeetingManager:
                 find_whisper_snapshot(model)
         except FileNotFoundError:
             raise RuntimeError(f"Whisper '{model}' não foi encontrado no cache local configurado em HF_HOME. A captura não foi iniciada e nenhum áudio foi gravado.") from None
-        device = request.get("whisper_device", "cuda")
+        device = request.get("whisper_device", "cpu" if sys.platform == "darwin" else "cuda")
         if device not in {"cuda", "cpu"}:
             raise ValueError("Dispositivo Whisper inválido.")
         port = int(request.get("ollama_port", DEFAULT_OLLAMA_PORT))
@@ -1058,8 +1508,8 @@ class MeetingManager:
             raise ValueError("O modelo LLM não está instalado nesse Ollama local.")
         cards = normalize_boxes(request.get("boxes", default_boxes()))
         final_config = normalize_final_config(request.get("final_analysis_config"))
-        interval = int(request.get("analysis_interval_s", DEFAULT_ANALYSIS_SECONDS))
-        if not 60 <= interval <= 600:
+        interval = request.get("analysis_interval_s", DEFAULT_ANALYSIS_SECONDS)
+        if type(interval) is not int or not 60 <= interval <= 600:
             raise ValueError("O intervalo de análise deve ficar entre 60 e 600 segundos.")
         if mode not in {"both", "mic_only", "pc_only"}:
             raise ValueError("Modo de captura inválido.")
@@ -1077,50 +1527,238 @@ class MeetingManager:
         chunks = folder / ".chunks"
         chunks.mkdir(mode=0o700)
         chunks_pattern = str(chunks / "chunk_%06d.wav")
-        cmd = build_ffmpeg_command(self.ffmpeg, mode, mic, pc, float(request.get("mic_volume", 1)), float(request.get("pc_volume", 1)), chunks_pattern, DEFAULT_CHUNK_SECONDS)
+        capture_options = {"backend": backend} if backend != "pulse" else {}
+        cmd = build_ffmpeg_command(self.ffmpeg, mode, mic, pc, float(request.get("mic_volume", 1)), float(request.get("pc_volume", 1)), chunks_pattern, DEFAULT_CHUNK_SECONDS, **capture_options)
+        if backend == "avfoundation":
+            # AVFoundation indices can change between FFmpeg enumeration and capture.
+            # Resolve only validated selections to OS-discovered names; no shell is used.
+            mic_name = next((d.get("name") for d in devices["microphones"] if d["id"] == mic), None)
+            pc_name = next((d.get("name") for d in devices["monitors"] if d["id"] == pc), None)
+            selected_names = [mic_name, pc_name] if mode == "both" else [mic_name if mode == "mic_only" else pc_name]
+            input_positions = [index + 1 for index, value in enumerate(cmd) if value == "-i"]
+            for index, name in zip(input_positions, selected_names):
+                if name:
+                    cmd[index] = ":" + name
+        # Validate safety paths before any capture process exists.
+        capture_started = time.monotonic()
+        audio_monitor = AudioSafety(chunks, started=capture_started)
         try:
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=False, close_fds=True)
         except Exception as exc:
             raise RuntimeError(f"Não foi possível iniciar a captura de áudio: {type(exc).__name__}.") from None
-        self.recorder = proc
-        self.last_error = ""
-        self.last_ffmpeg_error = ""
-        self.stop_requested = False
-        self._last_analyzed_segment_count = 0
-        self._last_analysis_error = ""
-        self.session = {"session_id": session_id, "state": "recording", "folder": str(folder), "chunks_dir": str(chunks),
-                        "manual_notes": manual_notes, "manual_notes_revision": 0,
-                        "audio_file": str(self.recordings_dir / f"{session_id}.wav"),
-                        "transcript_file": str(self.recordings_dir / f"{session_id}.txt"),
-                        "session_json": str(folder / "session.json"), "transcript_json": str(folder / "transcript.json"),
-                        "started_at": datetime.now().astimezone().isoformat(timespec="seconds"), "started_monotonic": time.monotonic(),
-                        "elapsed_s": 0, "segments": [], "next_chunk": 0, "analysis_summary": "", "cards": cards, "analyses": {}, "context_compaction": {},
-                        "final_analysis_config": final_config, "final_analysis": {}, "final_analysis_state": "pending", "final_analysis_error": "",
-                        "capture_mode": mode, "whisper_model": model, "whisper_device": device,
-                        "transcription_mode": options["transcription_mode"],
-                        "live_analysis_enabled": options["live_analysis_enabled"],
-                        "final_analysis_enabled": options["final_analysis_enabled"], "llm_model": llm_model,
-                        "ollama_port": port, "analysis_interval_s": interval, "last_analysis_elapsed": 0,
-                        "chunk_seconds": DEFAULT_CHUNK_SECONDS}
-        atomic_write_json(pathlib.Path(self.session["session_json"]), self._persistable_session())
-        self.stderr_thread = threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True, name="LiveMeetingFFmpegStderr")
-        self.stderr_thread.start()
-        time.sleep(0.2)
-        if proc.poll() is not None:
-            self._drain_stop_error(proc)
-            self.session["state"] = "error"
-            self.session["error"] = "FFmpeg encerrou durante a inicialização. Verifique as fontes PulseAudio/PipeWire."
-            self.last_error = self.session["error"]
-            self._persist()
-            raise RuntimeError(self.session["error"])
-        self._start_resource_monitor(self.session)
-        self.worker_thread = threading.Thread(target=self._processing_loop, args=(self.session,), daemon=True, name="LiveMeetingTranscriber")
-        self.worker_thread.start()
-        return self.status()
+        try:
+            self.recorder = proc
+            self.last_error = ""
+            self.last_ffmpeg_error = ""
+            self.stop_requested = False
+            self._last_analyzed_segment_count = 0
+            self._last_analysis_error = ""
+            self.session = {"session_id": session_id, "state": "recording", "folder": str(folder), "chunks_dir": str(chunks),
+                            "manual_notes": manual_notes, "manual_notes_revision": 0,
+                            "audio_file": str(self.recordings_dir / f"{session_id}.wav"),
+                            "transcript_file": str(self.recordings_dir / f"{session_id}.txt"),
+                            "session_json": str(folder / "session.json"), "transcript_json": str(folder / "transcript.json"),
+                            "started_at": datetime.now().astimezone().isoformat(timespec="seconds"), "started_monotonic": capture_started,
+                            "elapsed_s": 0, "segments": [], "next_chunk": 0, "analysis_summary": "", "cards": cards, "analyses": {}, "context_compaction": {},
+                            "final_analysis_config": final_config, "final_analysis": {}, "final_analysis_state": "pending", "final_analysis_error": "",
+                            "capture_mode": mode, "capture_backend": backend, "whisper_model": model, "whisper_device": device,
+                            "transcription_mode": options["transcription_mode"],
+                            "transcription_interval_s": normalize_transcription_interval(request),
+                            "live_analysis_enabled": options["live_analysis_enabled"],
+                            "final_analysis_enabled": options["final_analysis_enabled"], "llm_model": llm_model,
+                            "ollama_port": port, "analysis_interval_s": interval, "last_analysis_elapsed": 0,
+                            "chunk_seconds": DEFAULT_CHUNK_SECONDS}
+            self.session["recording_only"] = self.resource_guard.recording_only
+            self.stderr_thread = threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True, name="LiveMeetingFFmpegStderr")
+            self.stderr_thread.start()
+            try:
+                atomic_write_json(pathlib.Path(self.session["session_json"]), self._persistable_session())
+            except OSError:
+                # Metadata failure must not strand an unmonitored live recorder.
+                self.session["processing_error"] = "checkpoint_write_error"
+                self.session["error"] = "Falha no checkpoint inicial; captura supervisionada, pare e preserve os segmentos originais."
+            time.sleep(0.2)
+            if proc.poll() is not None:
+                self._drain_stop_error(proc)
+                self.session["state"] = "error"
+                self.session["error"] = (
+                    "FFmpeg AVFoundation encerrou durante a inicialização. Verifique os dispositivos, a permissão de Microfone em Ajustes do Sistema > Privacidade e Segurança e o roteamento BlackHole/Loopback."
+                    if backend == "avfoundation" else
+                    "FFmpeg encerrou durante a inicialização. Verifique as fontes PulseAudio/PipeWire.")
+                self.last_error = self.session["error"]
+                self._persist()
+                raise RuntimeError(self.session["error"])
+            self._start_resource_monitor(self.session)
+            self._start_audio_safety(self.session, audio_monitor)
+            self.worker_thread = threading.Thread(target=self._processing_loop, args=(self.session,), daemon=True, name="LiveMeetingTranscriber")
+            if self.session.get("processing_error"):
+                self.resource_guard.fail("checkpoint_write_error")
+            self.worker_thread.start()
+            return self.status()
+        except Exception as exc:
+            # Partial startup owns the recorder and both supervisors until handoff.
+            self.stop_requested = True
+            if self.session is not None:
+                self.session["state"] = "error"
+                self.session["error"] = str(exc)
+                self.last_error = str(exc)
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=3)
+            finally:
+                try:
+                    self._stop_audio_safety()
+                finally:
+                    if self.session is not None:
+                        self._stop_resource_monitor(self.session)
+            raise
+
+    def resume_pending(self, session_id):
+        """Explicit recovery of a stopped checkpoint, never automatic capture replay."""
+        if not isinstance(session_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+            raise ValueError("Identificador de sessão inválido.")
+        with self._start_lock:
+            with self.lock:
+                if self._shutdown_requested.is_set():
+                    raise RuntimeError("O aplicativo está encerrando.")
+                if ((self.worker_thread and self.worker_thread.is_alive())
+                        or (self.recorder and self.recorder.poll() is None)
+                        or self._analysis_busy
+                        or (self.session and not self.session.get("resource_deferred") and self.session.get("state") in {"recording", "processing", "final_analysis"})):
+                    raise RuntimeError("Já há uma reunião ativa; não é seguro retomar outra sessão.")
+            root = self.recordings_dir.resolve()
+            folder = (root / session_id).resolve()
+            if folder.parent != root:
+                raise ValueError("Pasta de sessão inválida.")
+            metadata = folder / "session.json"
+            try:
+                if metadata.resolve().parent != folder or metadata.stat().st_size > 20 * 1024 * 1024:
+                    raise ValueError("Checkpoint de sessão inválido.")
+                data = strict_json_loads(metadata.read_text(encoding="utf-8"))
+                if (not isinstance(data, dict) or data.get("session_id") != session_id
+                        or data.get("state") not in {"processing", "recording", "error", "final_analysis"}):
+                    raise ValueError("A sessão não tem processamento pendente para retomar.")
+                chunks_dir = (folder / ".chunks").resolve()
+                if chunks_dir.parent != folder or not chunks_dir.is_dir():
+                    raise ValueError("Segmentos originais de áudio não estão disponíveis.")
+                paths = sorted(chunks_dir.glob("chunk_*.wav"))
+                indices = []
+                for path in paths:
+                    match = re.fullmatch(r"chunk_(\d+)\.wav", path.name)
+                    if not match or path.resolve().parent != chunks_dir:
+                        raise ValueError("Segmento de áudio inválido.")
+                    indices.append(int(match.group(1)))
+                    with path.open("rb") as source:
+                        file_size = os.fstat(source.fileno()).st_size
+                        header = source.read(12)
+                        riff_size = int.from_bytes(header[4:8], "little")
+                        if (len(header) != 12 or header[:4] != b"RIFF" or header[8:] != b"WAVE"
+                                or riff_size == 0xFFFFFFFF or riff_size > file_size - 8):
+                            raise ValueError("Segmento de áudio incompleto; preserve os originais antes de recuperar.")
+                        source.seek(0)
+                        with wave.open(source, "rb") as wav:
+                            if wav.getframerate() != 16000 or wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+                                raise ValueError("Formato de áudio do checkpoint inválido.")
+                            frames = wav.getnframes()
+                            # Reject impossible/sentinel data sizes before reading PCM. Never
+                            # allocate a buffer proportional to an untrusted WAV frame count.
+                            if frames * 2 > file_size:
+                                raise ValueError("Segmento de áudio incompleto; preserve os originais antes de recuperar.")
+                            while frames:
+                                count = min(frames, 32768)  # At most 64 KiB of mono PCM16.
+                                if len(wav.readframes(count)) != count * 2:
+                                    raise ValueError("Segmento de áudio incompleto; preserve os originais antes de recuperar.")
+                                frames -= count
+                if not indices or indices != list(range(len(indices))):
+                    raise ValueError("Há segmentos de áudio ausentes; recuperação automática recusada.")
+                next_chunk = data.get("next_chunk")
+                if type(next_chunk) is not int or not 0 <= next_chunk <= len(indices):
+                    raise ValueError("Checkpoint de transcrição inválido.")
+                segments = data.get("segments")
+                if not isinstance(segments, list):
+                    raise ValueError("Transcrição do checkpoint inválida.")
+                for row in segments:
+                    if (not isinstance(row, dict) or not isinstance(row.get("text"), str)
+                            or not isinstance(row.get("start"), (int, float))
+                            or not isinstance(row.get("end"), (int, float))
+                            or not math.isfinite(row["start"]) or not math.isfinite(row["end"])
+                            or not 0 <= row["start"] <= row["end"]):
+                        raise ValueError("Trecho da transcrição inválido.")
+                for key in ("audio_file", "transcript_file"):
+                    target = pathlib.Path(data[key]).resolve()
+                    suffix = ".wav" if key == "audio_file" else ".txt"
+                    allowed_root_targets = {root / (session_id + suffix)}
+                    if key == "transcript_file":
+                        allowed_root_targets.add(root / (session_id + "_transcricao.txt"))
+                    if (target.suffix != suffix or not (
+                            target in allowed_root_targets or target.parent == folder)):
+                        raise ValueError("Caminho de saída do checkpoint inválido.")
+                    data[key] = str(target)
+                if data.get("ollama_port", DEFAULT_OLLAMA_PORT) not in (11434, 11435):
+                    raise ValueError("Endpoint Ollama deve ser local (11434 ou 11435).")
+                elapsed = float(data.get("elapsed_s", 0))
+                if not math.isfinite(elapsed) or elapsed < 0:
+                    raise ValueError("Duração do checkpoint inválida.")
+                data.update(cards=normalize_boxes(data.get("cards", default_boxes())),
+                            final_analysis_config=normalize_final_config(data.get("final_analysis_config")),
+                            manual_notes=normalize_manual_notes(data.get("manual_notes", {})))
+                data["transcription_interval_s"] = normalize_transcription_interval(data)
+                chunk_seconds = data.get("chunk_seconds", DEFAULT_CHUNK_SECONDS)
+                if type(chunk_seconds) is not int or chunk_seconds <= 0:
+                    raise ValueError("Intervalo dos segmentos inválido.")
+            except (OSError, EOFError, wave.Error, KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise ValueError("Não foi possível validar o checkpoint local; nenhum arquivo foi alterado.") from exc
+            data.update(state="processing", folder=str(folder), chunks_dir=str(chunks_dir),
+                        session_json=str(metadata), transcript_json=str(folder / "transcript.json"),
+                        started_monotonic=time.monotonic() - elapsed, elapsed_s=elapsed,
+                        chunk_seconds=chunk_seconds, force_analysis=False, last_analysis_elapsed=elapsed,
+                        error="", final_analysis_state="not_run", final_analysis_error="")
+            data.pop("resource_deferred", None)
+            data.pop("processing_error", None)
+            data.setdefault("analyses", {})
+            data.setdefault("whisper_model", "small")
+            data.setdefault("whisper_device", "cpu")
+            data.setdefault("llm_model", DEFAULT_LLM_MODEL)
+            data.setdefault("ollama_port", DEFAULT_OLLAMA_PORT)
+            data.setdefault("analysis_interval_s", DEFAULT_ANALYSIS_SECONDS)
+            with self.lock:
+                previous = self.session
+                same_session = previous is not None and previous.get("session_id") == session_id
+            if previous is not None and not same_session:
+                # Join outside the manager lock: the sampler needs it to exit.
+                self._stop_resource_monitor(previous)
+            with self.lock:
+                if self._shutdown_requested.is_set():
+                    raise RuntimeError("O aplicativo está encerrando.")
+                if not same_session and self._resource_thread and self._resource_thread.is_alive():
+                    raise RuntimeError("Resource monitor still stopping")
+                if same_session and previous is not None:
+                    # Keep the dictionary identity owned by the running sampler and
+                    # preserve pressure hysteresis, manual pause and latched failures.
+                    data["recording_only"] = self.resource_guard.recording_only
+                    previous.clear()
+                    previous.update(data)
+                    data = previous
+                self.session = data
+                self.recorder = None
+                self.stop_requested = True
+                self.last_error = self._last_analysis_error = ""
+                self._last_analyzed_segment_count = 0
+                self._persist()
+                self._start_resource_monitor(data)
+                self.worker_thread = threading.Thread(target=self._processing_loop, args=(data,), daemon=True,
+                                                      name="LiveMeetingTranscriber")
+                self.worker_thread.start()
+                return self.status()
 
     def stop(self):
         with self.lock:
-            if not self.session or self.session["state"] != "recording":
+            if not self.session or (not self._recorder_alive() and self.session["state"] != "recording"):
                 raise RuntimeError("Não há gravação ativa para parar.")
             self.stop_requested = True
             proc = self.recorder
@@ -1154,7 +1792,14 @@ class MeetingManager:
         with self.lock:
             if self.session:
                 self.session["elapsed_s"] = max(0, time.monotonic() - self.session["started_monotonic"])
-                self._persist()
+                try:
+                    self._persist()
+                except OSError:
+                    self.resource_guard.fail("checkpoint_write_error")
+                if not self.worker_thread or not self.worker_thread.is_alive():
+                    self.worker_thread = threading.Thread(target=self._processing_loop, args=(self.session,), daemon=True,
+                                                          name="StoppedMeetingFinalizer")
+                    self.worker_thread.start()
         return self.status()
 
     def update_live_boxes(self, raw_boxes):
@@ -1180,6 +1825,8 @@ class MeetingManager:
 
     def analyze_now(self):
         with self.lock:
+            if not self.resource_guard.allowed("llm"):
+                raise RuntimeError("Análise adiada pela proteção de recursos: " + self.resource_guard.snapshot()["reason"])
             if not self.session or not self.session.get("segments"):
                 raise RuntimeError("Ainda não há transcrição para analisar.")
             if self.session.get("transcription_mode", "live") != "live" or not self.session.get("live_analysis_enabled", True):
@@ -1189,28 +1836,41 @@ class MeetingManager:
 
     def shutdown(self):
         with self.lock:
-            active = bool(self.session and self.session["state"] == "recording")
+            active = self._recorder_alive()
         if active:
             try:
                 self.stop()
             except Exception:
                 pass
+        with self._analysis_condition:
+            self._shutdown_requested.set()
+            self._inference_cancel.set()
+            self._analysis_pending = None
+            self._analysis_condition.notify_all()
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=15)
+        if self._analysis_thread and self._analysis_thread.is_alive():
+            # HTTP inference already has a finite timeout; do not wait for it here.
+            self._analysis_thread.join(timeout=1)
+        self._stop_audio_safety()
+        if self.session is not None:
+            self._stop_resource_monitor(self.session)
 
     def _drain_stderr(self, proc):
         try:
             for raw in iter(proc.stderr.readline, b""):
                 line = raw.decode("utf-8", errors="replace").strip()
                 if line:
-                    self.last_ffmpeg_error = line[-500:]
+                    self.last_ffmpeg_error = (self.last_ffmpeg_error + "\n" + line)[-4096:]
         except Exception:
             pass
 
     def _drain_stop_error(self, proc):
         try:
             if proc.stderr:
-                self.last_ffmpeg_error = proc.stderr.read(4096).decode("utf-8", errors="replace")[-500:]
+                detail = proc.stderr.read(4096).decode("utf-8", errors="replace").strip()
+                if detail:
+                    self.last_ffmpeg_error = (self.last_ffmpeg_error + "\n" + detail)[-4096:]
         except Exception:
             pass
 
@@ -1218,7 +1878,8 @@ class MeetingManager:
         s = self.session
         if not s:
             return {}
-        return {k: s[k] for k in ("session_id", "state", "manual_notes", "manual_notes_revision", "started_at", "elapsed_s", "audio_file", "transcript_file", "capture_mode", "source_filename", "whisper_model", "whisper_device", "transcription_mode", "live_analysis_enabled", "final_analysis_enabled", "llm_model", "ollama_port", "analysis_interval_s", "segments", "cards", "analysis_summary", "analyses", "context_compaction", "final_analysis_config", "final_analysis", "final_analysis_state", "final_analysis_error", "next_chunk", "resource_usage", "error") if k in s}
+        keys = ("session_id", "state", "manual_notes", "manual_notes_revision", "started_at", "elapsed_s", "audio_file", "transcript_file", "capture_mode", "source_filename", "whisper_model", "whisper_device", "transcription_mode", "live_analysis_enabled", "final_analysis_enabled", "llm_model", "ollama_port", "analysis_interval_s", "segments", "cards", "analysis_summary", "analyses", "context_compaction", "final_analysis_config", "final_analysis", "final_analysis_state", "final_analysis_error", "next_chunk", "chunk_seconds", "resource_usage", "error", "transcription_interval_s", "recording_only", "resource_deferred", "processing_error", "capture_warning")
+        return {k: s[k] for k in keys if k in s}
 
     def _persist(self):
         if self.session:
@@ -1246,28 +1907,88 @@ class MeetingManager:
             atomic_write_json(final_path, self.session.get("final_analysis", {}))
 
     def _load_whisper(self, model_name: str, device: str):
-        snapshot = find_whisper_snapshot(model_name)
-        if SOURCE_APP.is_dir() and str(SOURCE_APP) not in sys.path:
-            sys.path.insert(0, str(SOURCE_APP))
-        try:
-            from transcriber import ensure_cuda_environment
-        except ImportError:
-            ensure_cuda_environment = None
-        if ensure_cuda_environment:
-            ensure_cuda_environment()
-        from faster_whisper import WhisperModel
-        compute = "float16" if device == "cuda" else "int8"
-        return WhisperModel(str(snapshot), device=device, compute_type=compute)
+        # Weights/native libraries only live in the cancellable child.
+        return {"snapshot": str(find_whisper_snapshot(model_name)), "device": device}
 
     def _transcribe_chunk(self, model, path: pathlib.Path, chunk_index: int, language: str = "pt"):
+        if isinstance(model, dict) and "snapshot" in model:
+            from inference_worker import run_whisper, WorkerCancelled
+            try:
+                rows, detected = run_whisper(model, path, language=language,
+                                             cancelled=lambda: self._inference_cancel.is_set() or self._shutdown_requested.is_set()
+                                             or not self.resource_guard.allowed("whisper"),
+                                             process_changed=lambda proc: setattr(self, "_whisper_process", proc))
+            except WorkerCancelled as exc:
+                raise InferenceDeferred(str(exc)) from exc
+            return offset_segments(chunk_index, rows, self.session["chunk_seconds"]), detected
+        # Preserve injected fake-model seam; production never takes this path.
         segments, info = model.transcribe(str(path), language=language, beam_size=2, vad_filter=True,
                                           vad_parameters={"min_silence_duration_ms": 400})
         rows = [{"start": float(seg.start), "end": float(seg.end), "text": seg.text} for seg in segments]
         return offset_segments(chunk_index, rows, self.session["chunk_seconds"]), info.language
 
-    def _maybe_analyze(self, force: bool = False, model=None):
+    def _schedule_analysis(self, expected_session: dict, force: bool = False):
+        """Nonblocking notification; the analysis worker snapshots the latest text."""
+        with self._analysis_condition:
+            if self._shutdown_requested.is_set() or self.session is not expected_session:
+                return
+            s = expected_session
+            if not self.resource_guard.allowed("llm"):
+                return
+            if (not s.get("live_analysis_enabled", True)
+                    or s.get("transcription_mode", "live") != "live" or not s.get("segments")):
+                return
+            if not (force or s.get("force_analysis") or time.monotonic() - s["started_monotonic"] - s.get("last_analysis_elapsed", 0) >= s["analysis_interval_s"]):
+                return
+            pending = self._analysis_pending
+            self._analysis_pending = (s, force or bool(pending and pending[0] is s and pending[1]))
+            if self._analysis_thread is None:
+                self._analysis_thread = threading.Thread(target=self._analysis_loop, daemon=True,
+                                                        name="LiveMeetingAnalysis")
+                self._analysis_thread.start()
+            self._analysis_condition.notify_all()
+
+    def _analysis_loop(self):
+        while True:
+            with self._analysis_condition:
+                self._analysis_condition.wait_for(lambda: self._analysis_pending is not None
+                                                  or self._shutdown_requested.is_set())
+                if self._shutdown_requested.is_set():
+                    return
+                pending = self._analysis_pending
+                if pending is None:
+                    continue
+                s, force = pending
+                self._analysis_pending = None
+                self._analysis_busy = True
+            try:
+                self._maybe_analyze(force=force, expected_session=s)
+            except Exception as exc:
+                # Even a persistence failure must not kill the sole analysis daemon.
+                # Do not retry the failing write here or log private meeting content.
+                with self.lock:
+                    if self.session is s and not self._shutdown_requested.is_set():
+                        self._last_analysis_error = f"Falha ao salvar análise local: {type(exc).__name__}."
+            finally:
+                with self._analysis_condition:
+                    self._analysis_busy = False
+                    self._analysis_condition.notify_all()
+
+    def _wait_for_analysis(self):
+        # Only used AFTER the complete transcript and audio have been saved.
+        with self._analysis_condition:
+            self._analysis_condition.wait_for(lambda: self._shutdown_requested.is_set()
+                                              or (not self._analysis_busy and self._analysis_pending is None))
+            return not self._shutdown_requested.is_set()
+
+    @_llm_analysis_budget()
+    def _maybe_analyze(self, force: bool = False, model=None, expected_session: dict | None = None):
         with self.lock:
+            if not self.resource_guard.allowed("llm"):
+                return model
             s = self.session
+            if self._shutdown_requested.is_set() or (expected_session is not None and s is not expected_session):
+                return model
             if not s or not s.get("segments") or not s.get("live_analysis_enabled", True) or s.get("transcription_mode", "live") != "live":
                 return model
             force_requested = force or s.get("force_analysis", False)
@@ -1280,47 +2001,59 @@ class MeetingManager:
             transcript = "\n".join(str(x.get("text", "")).strip() for x in s["segments"] if str(x.get("text", "")).strip())
             summary_candidate = ""
             cards = [dict(box) for box in s["cards"]]
-            context_compaction = s.setdefault("context_compaction", {})
+            context_compaction = copy.deepcopy(s.get("context_compaction", {}))
             port, llm_model = s["ollama_port"], s["llm_model"]
             target_segments = len(s["segments"])
             analysis_revision = s.get("analysis_revision", 0)
             s["force_analysis"] = False
-        if model is not None:
-            del model
-            model = None
-            gc.collect()
+        def current():
+            return (not self._shutdown_requested.is_set() and self.session is s
+                    and s.get("analysis_revision", 0) == analysis_revision
+                    and (s["ollama_port"], s["llm_model"]) == (port, llm_model)
+                    and s.get("state") in {"recording", "processing"}
+                    and s.get("live_analysis_enabled", True))
+
+        # Whisper belongs exclusively to the transcriber; live analysis never evicts it.
         collected = {}
         try:
             batches = analysis_batches(cards)
             for batch in batches:
                 for attempt in range(2):
                     try:
-                        summary_candidate, batch_results = _ollama_call(port, llm_model, transcript, batch, "", context_compaction)
+                        with self._inference("llm"):
+                            summary_candidate, batch_results = _ollama_call(port, llm_model, transcript, batch, "", context_compaction)
                         break
                     except ValueError:
                         if attempt:
                             raise
                 collected.update(batch_results)
                 with self.lock:
-                    if self.session is not s or s.get("analysis_revision", 0) != analysis_revision:
+                    if self._shutdown_requested.is_set():
+                        return model
+                    if not current():
                         if self.session is s:
                             s["force_analysis"] = True
                         return model
 
             with self.lock:
-                if self.session is s and s.get("analysis_revision", 0) == analysis_revision:
+                if current() and self.resource_guard.allowed("llm"):
                     for ident, text in collected.items():
                         s["analyses"][ident] = {"text": text, "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"), "segment_count": target_segments}
                     s["analysis_summary"] = summary_candidate
-                    s["last_analysis_elapsed"] = elapsed
+                    s["context_compaction"] = context_compaction
+                    s["last_analysis_elapsed"] = max(0, time.monotonic() - s["started_monotonic"])
                     self._last_analyzed_segment_count = target_segments
                     self._last_analysis_error = ""
                     self._persist()
                 elif self.session is s:
                     s["force_analysis"] = True
+        except InferenceDeferred:
+            return model
         except Exception as exc:
             with self.lock:
-                if self.session is s and s.get("analysis_revision", 0) != analysis_revision:
+                if self._shutdown_requested.is_set():
+                    return model
+                if self.session is s and not current():
                     s["force_analysis"] = True
                     return model
                 if self.session is s:
@@ -1329,9 +2062,21 @@ class MeetingManager:
                     else:
                         detail = "resposta estruturada do modelo inválida" if isinstance(exc, ValueError) else type(exc).__name__
                         self._last_analysis_error = f"Análise local indisponível após uma nova tentativa: {detail}. A transcrição continua sendo salva."
-                    s["last_analysis_elapsed"] = elapsed
+                    s["last_analysis_elapsed"] = max(0, time.monotonic() - s["started_monotonic"])
                     self._persist()
         return model
+
+    def _capture_error(self, reason):
+        if (self.session or {}).get("capture_backend") == "avfoundation":
+            if any(marker in self.last_ffmpeg_error.lower() for marker in
+                   ("permission denied", "not authorized", "not authorised", "access denied")):
+                reason += " Acesso ao Microfone negado pelo macOS."
+            return AudioCaptureError(
+                f"{reason} AVFoundation: verifique a permissão de Microfone em Ajustes do Sistema > "
+                "Privacidade e Segurança para o aplicativo que iniciou a captura (Terminal ou Python do serviço). "
+                "Se houver um pedido de acesso pendente, autorize-o e inicie uma nova gravação. "
+                "Verifique também o dispositivo selecionado e, para áudio do sistema, o roteamento BlackHole/Loopback.")
+        return AudioCaptureError(f"{reason} Verifique os dispositivos e as fontes PulseAudio/PipeWire.")
 
     def _finalize_audio(self):
         s = self.session
@@ -1339,8 +2084,15 @@ class MeetingManager:
             return
         folder = pathlib.Path(s["chunks_dir"])
         chunks = sorted(folder.glob("chunk_*.wav"))
-        if not chunks:
-            raise RuntimeError("Nenhum segmento de áudio foi gravado.")
+        free = self.resource_guard.snapshot()["latest"].get("disk_free_mib")
+        if free is not None and free < 128 + sum(path.stat().st_size for path in chunks) / 1048576:
+            raise AudioCaptureError("Disco sem reserva para unir áudio; segmentos originais preservados, finalização pendente.")
+        has_frames = False
+        for path in chunks:
+            with wave.open(str(path), "rb") as wav:
+                has_frames = has_frames or wav.getnframes() > 0
+        if not has_frames:
+            raise self._capture_error("Nenhum frame de áudio foi recebido; nenhum áudio foi salvo.")
         audio_path = pathlib.Path(s["audio_file"])
         list_path = folder / "concat.txt"
         with open(list_path, "w", encoding="utf-8") as f:
@@ -1354,23 +2106,18 @@ class MeetingManager:
             if w.getframerate() != 16000 or w.getnframes() <= 0:
                 raise RuntimeError("Arquivo final de áudio passou por validação inválida.")
         os.chmod(audio_path, 0o600)
-        for p in chunks:
-            p.unlink(missing_ok=True)
+        # Raw capture is authoritative recovery material; keep every original WAV.
         list_path.unlink(missing_ok=True)
-        try:
-            folder.rmdir()
-        except OSError:
-            pass
 
     def _run_final_analysis(self, expected_session: dict):
         with self.lock:
             s = self.session
-            if not s or s is not expected_session:
+            if not s or s is not expected_session or self._shutdown_requested.is_set():
                 return
             transcript = transcript_text_without_timestamps(s.get("segments", []))
             config = normalize_final_config(s.get("final_analysis_config"))
             port, model = s["ollama_port"], s["llm_model"]
-            context_compaction = s.setdefault("context_compaction", {})
+            context_compaction = copy.deepcopy(s.get("context_compaction", {}))
             if not s.get("final_analysis_enabled", True) or s.get("transcription_mode", "live") == "off":
                 s["final_analysis"] = {}
                 s["final_analysis_state"] = "skipped"
@@ -1379,26 +2126,40 @@ class MeetingManager:
                 s["elapsed_s"] = max(0, time.monotonic() - s["started_monotonic"])
                 self._persist()
                 return
+            if not self.resource_guard.allowed("llm"):
+                s.update(final_analysis_state="deferred", final_analysis_error="Proteção de recursos: análise final pendente.",
+                         state="processing", resource_deferred=True, force_analysis=False)
+                self._persist()
+                return
         try:
             if transcript:
-                result = _ollama_final_call(port, model, transcript, config, context_compaction)
+                with self._inference("llm"):
+                    result = _ollama_final_call(port, model, transcript, config, context_compaction)
             else:
                 result = {"summary": "Nenhuma fala foi transcrita nesta gravação.", "tasks": [],
                           "results": {b["id"]: "Não há transcrição para analisar." for b in config["boxes"] if b["enabled"]},
                           "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"), "source_chars": 0}
             with self.lock:
-                if self.session is not s:
+                if self.session is not s or self._shutdown_requested.is_set():
                     return
+                if not self.resource_guard.allowed("llm"):
+                    raise InferenceDeferred("resource_pressure")
                 s["final_analysis"] = result
+                s["context_compaction"] = context_compaction
                 s["final_analysis_state"] = "completed"
                 s["final_analysis_error"] = ""
                 s["state"] = "completed"
                 s["elapsed_s"] = max(0, time.monotonic() - s["started_monotonic"])
                 s["error"] = ""
                 self._persist()
+        except InferenceDeferred:
+            with self.lock:
+                if self.session is s and not self._shutdown_requested.is_set():
+                    s.update(final_analysis_state="deferred", state="processing", resource_deferred=True)
+                    self._persist()
         except Exception as exc:
             with self.lock:
-                if self.session is s:
+                if self.session is s and not self._shutdown_requested.is_set():
                     s["final_analysis_state"] = "error"
                     detail = "resposta JSON inválida" if isinstance(exc, ValueError) else type(exc).__name__
                     s["final_analysis_error"] = f"Análise final local indisponível ({detail}). Áudio e transcrição foram salvos."
@@ -1416,7 +2177,7 @@ class MeetingManager:
             while True:
                 with self.lock:
                     s = self.session
-                    if not s:
+                    if not s or s is not expected_session or self._shutdown_requested.is_set():
                         return
                     next_index = s["next_chunk"]
                     proc = self.recorder
@@ -1431,6 +2192,25 @@ class MeetingManager:
                         indexed.append((int(match.group(1)), path))
                 current_max = max((i for i, _ in indexed), default=-1)
                 recording_alive = proc is not None and proc.poll() is None
+                if proc is not None and not recording_alive and not stop_requested:
+                    raise self._capture_error("O processo de captura de áudio encerrou inesperadamente.")
+                if (self.resource_guard.enabled and not recording_alive and stop_requested
+                        and self._inference_kind == "llm"):
+                    # Saving capture must not depend on a remote inference returning.
+                    self._finalize_audio()
+                    with self.lock:
+                        s.update(resource_deferred=True, state="processing", final_analysis_state="deferred", force_analysis=False)
+                        self._persist()
+                    return
+                if not self.resource_guard.allowed("whisper") and s.get("transcription_mode", "live") != "off":
+                    if not recording_alive and stop_requested:
+                        self._finalize_audio()
+                        with self.lock:
+                            s.update(resource_deferred=True, state="processing", final_analysis_state="deferred", force_analysis=False)
+                            self._persist()
+                        return
+                    time.sleep(0.5)
+                    continue
                 transcription_mode = s.get("transcription_mode", "live")
                 if transcription_mode == "off":
                     ready = []
@@ -1445,41 +2225,81 @@ class MeetingManager:
                     ready = [(i, p) for i, p in indexed if i >= next_index and (not recording_alive or i < current_max)]
                 if ready:
                     index, path = ready[0]
+                    if not recording_alive:
+                        with wave.open(str(path), "rb") as wav:
+                            empty = wav.getnframes() == 0
+                        if empty:
+                            with self.lock:
+                                if self.session is s:
+                                    s["next_chunk"] = index + 1
+                            continue
                     if path.stat().st_size <= 44:
                         time.sleep(0.5)
                         continue
                     if model is None:
                         model = self._load_whisper(s["whisper_model"], s["whisper_device"])
-                    rows, language = self._transcribe_chunk(model, path, index, "pt")
+                    isolated = isinstance(model, dict) and "snapshot" in model
+                    interval = self.resource_guard.snapshot(transcription_interval_s=s.get("transcription_interval_s", DEFAULT_CHUNK_SECONDS))["effective_transcription_interval_s"]
+                    # At most one real chunk per bounded window, including stopped backlog.
+                    if isolated and (interval is None or time.monotonic() - s.get("last_transcription_monotonic", -1e20) < interval):
+                        time.sleep(0.2)
+                        continue
+                    try:
+                        with self._inference("whisper") if isolated else nullcontext():
+                            # Start-to-start cadence includes inference time; completion-to-start
+                            # pacing would fall behind 45-second capture even on healthy hardware.
+                            s["last_transcription_monotonic"] = time.monotonic()
+                            rows, language = self._transcribe_chunk(model, path, index, "pt")
+                    except InferenceDeferred:
+                        time.sleep(0.2)
+                        continue
                     with self.lock:
-                        if self.session is not s:
+                        if self._shutdown_requested.is_set() or self.session is not s:
                             return
+                        if not self.resource_guard.allowed("whisper"):
+                            continue
+                        old_segments, old_cursor, old_elapsed = list(s["segments"]), s["next_chunk"], s.get("elapsed_s", 0)
                         s["segments"].extend(rows)
                         s["next_chunk"] = index + 1
-                        s["elapsed_s"] = max(s.get("elapsed_s", 0), (index + 1) * s["chunk_seconds"])
-                        self._persist()
-                    model = self._maybe_analyze(force=False, model=model)
+                        s["elapsed_s"] = max(old_elapsed, (index + 1) * s["chunk_seconds"])
+                        try:
+                            self._persist()
+                        except Exception:
+                            s.update(segments=old_segments, next_chunk=old_cursor, elapsed_s=old_elapsed)
+                            raise
+                    self._schedule_analysis(s)
                     continue
                 with self.lock:
                     reanalyze_requested = (self.session is s and s.get("force_analysis", False) and bool(s.get("segments"))
                                            and s.get("transcription_mode", "live") == "live" and s.get("live_analysis_enabled", True))
                 if reanalyze_requested:
-                    model = self._maybe_analyze(force=False, model=model)
-                    continue
+                    self._schedule_analysis(s)
                 if not recording_alive and stop_requested and next_index > current_max:
-                    if transcription_mode == "live" and s.get("live_analysis_enabled", True):
-                        model = self._maybe_analyze(force=True, model=model)
                     if model is not None:
                         del model
                         model = None
                         gc.collect()
                     self._finalize_audio()
+                    if not self.resource_guard.enabled:
+                        self._schedule_analysis(s, force=True)
+                    elif not self._analysis_busy and self._analysis_pending is None:
+                        self._maybe_analyze(force=True, expected_session=s)
                     while True:
-                        model = self._maybe_analyze(force=False, model=model)
+                        with self._analysis_condition:
+                            defer = self.resource_guard.enabled and (self._analysis_busy or self._analysis_pending is not None)
+                            if defer:
+                                self._analysis_pending = None
+                                s.update(resource_deferred=True, state="processing", final_analysis_state="deferred", force_analysis=False)
+                                self._persist()
+                        if defer:
+                            return
+                        if not self._wait_for_analysis():
+                            return
                         with self.lock:
                             if self.session is not s:
                                 return
-                            if s.get("force_analysis", False):
+                            if s.get("force_analysis", False) and self.resource_guard.allowed("llm"):
+                                self._schedule_analysis(s)
                                 continue
                             s["state"] = "final_analysis"
                             s["final_analysis_state"] = "running"
@@ -1492,24 +2312,37 @@ class MeetingManager:
                 if not recording_alive and not stop_requested:
                     with self.lock:
                         s["state"] = "error"
-                        s["error"] = "O processo de captura de áudio encerrou inesperadamente."
+                        s["error"] = str(self._capture_error("O processo de captura de áudio encerrou inesperadamente."))
                         self.last_error = s["error"]
                         self._persist()
                     return
                 time.sleep(0.5)
         except Exception as exc:
             with self.lock:
-                if self.session:
-                    self.session["state"] = "error"
-                    self.session["error"] = f"Falha na transcrição ou finalização: {type(exc).__name__}."
+                if self.session is expected_session and self.session and not self._shutdown_requested.is_set():
+                    alive = self._recorder_alive()
+                    self.session["state"] = "recording" if alive else "error"
+                    if alive:
+                        self.session["processing_error"] = type(exc).__name__
+                        self.resource_guard.fail("inference_or_checkpoint_error")
+                    self.session["error"] = (str(exc) if isinstance(exc, AudioCaptureError) else
+                                             f"Falha na transcrição ou finalização: {type(exc).__name__}.")
                     self.last_error = self.session["error"]
-                    self._persist()
+                    try:
+                        self._persist()
+                    except Exception:
+                        self.resource_guard.fail("checkpoint_write_error")
         finally:
             if model is not None:
                 del model
                 gc.collect()
-            if expected_session is not None:
-                self._stop_resource_monitor(expected_session)
+            if expected_session is not None and self.session is expected_session and not self._recorder_alive():
+                # A stopped, deferred meeting still needs fresh samples and the
+                # normal recovery cooldowns before the UI can safely offer resume.
+                if self._shutdown_requested.is_set() or not expected_session.get("resource_deferred"):
+                    self._stop_resource_monitor(expected_session)
+                else:
+                    self._stop_audio_safety()
 
 
 class LoopbackServer(ThreadingHTTPServer):
@@ -1749,10 +2582,16 @@ def make_handler(manager: MeetingManager):
                 if self.path == "/api/start":
                     result = manager.start(payload)
                     self._send(200, result)
+                elif self.path == "/api/resume":
+                    if set(payload) != {"session_id"}:
+                        raise ValueError("Envie somente session_id para retomar um checkpoint local.")
+                    self._send(200, manager.resume_pending(payload["session_id"]))
                 elif self.path == "/api/stop":
                     self._send(200, manager.stop())
                 elif self.path == "/api/analyze":
                     self._send(202, manager.analyze_now())
+                elif self.path == "/api/resource-guard":
+                    self._send(200, manager.set_resource_guard(payload))
                 elif self.path == "/api/live-boxes":
                     if set(payload) != {"boxes"}:
                         raise ValueError("Envie somente o campo boxes para atualizar as análises ao vivo.")

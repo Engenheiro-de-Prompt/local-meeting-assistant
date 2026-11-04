@@ -1,6 +1,7 @@
 import http.client
 import json
 import pathlib
+import shutil
 import sys
 import tempfile
 import threading
@@ -147,6 +148,8 @@ class LocalServerSecurityTests(unittest.TestCase):
 
     def test_http_start_stop_endpoint_runs_synthetic_capture_and_finalizes_analysis(self):
         self._install_finished_session()
+        self.manager.ffmpeg = shutil.which("ffmpeg")
+        self.assertIsNotNone(self.manager.ffmpeg, "Synthetic integration requires FFmpeg on PATH")
         self.manager._start_resource_monitor = lambda *_args: None
         self.manager._load_whisper = lambda *_args: object()
         self.manager._transcribe_chunk = lambda _model, _path, index, _language: ([{"start": 0, "end": 0.5, "text": f"synthetic spoken segment {index}"}], "pt")
@@ -212,13 +215,15 @@ class LocalServerSecurityTests(unittest.TestCase):
     def test_open_routes_use_only_paths_from_the_current_session(self):
         _, transcript, _ = self._install_finished_session()
         headers = {"Host": f"127.0.0.1:{self.port}", "Origin": f"http://127.0.0.1:{self.port}", "Content-Type": "application/json"}
-        with patch.object(app.shutil, "which", return_value="/usr/bin/xdg-open"), patch.object(app.subprocess, "Popen") as popen:
+        opener = "/usr/bin/open" if sys.platform == "darwin" else "/usr/bin/xdg-open"
+        with patch.object(app.shutil, "which", return_value=opener) as which, patch.object(app.subprocess, "Popen") as popen:
             status, _, _ = self.request("POST", "/api/open/transcript", headers, b"{}")
             self.assertEqual(status, 202)
-            self.assertEqual(popen.call_args.args[0], ["/usr/bin/xdg-open", str(transcript)])
+            self.assertEqual(popen.call_args.args[0], [opener, str(transcript.resolve())])
             status, _, _ = self.request("POST", "/api/open/folder", headers, b"{}")
             self.assertEqual(status, 202)
-            self.assertEqual(popen.call_args.args[0], ["/usr/bin/xdg-open", self.tmp.name])
+            self.assertEqual(popen.call_args.args[0], [opener, str(pathlib.Path(self.tmp.name).resolve())])
+            which.assert_called_with("open" if sys.platform == "darwin" else "xdg-open")
 
     def test_import_upload_is_local_tokenized_and_streamed_to_a_temporary_file(self):
         headers = {"Host": f"127.0.0.1:{self.port}", "Origin": f"http://127.0.0.1:{self.port}", "Content-Type": "application/json"}

@@ -17,7 +17,7 @@ const elements=new Map(), storage=new Map(), requests=[], timers=[];
 function element(){return {value:'',checked:true,children:[],dataset:{},style:{},classList:{add(){},remove(){},toggle(){}},
  set textContent(v){this.children=[];this.text=v},get textContent(){return this.text||''},
  append(...children){for(const child of children){child.parentElement=this;this.children.push(child)}} ,remove(){if(this.parentElement)this.parentElement.children=this.parentElement.children.filter(x=>x!==this)},setAttribute(k,v){this[k]=v},removeAttribute(k){delete this[k]},
- setCustomValidity(v){this.validationMessage=v},reportValidity(){return !this.validationMessage}}}
+ setCustomValidity(v){this.validationMessage=v},checkValidity(){return !this.validationMessage},reportValidity(){return !this.validationMessage}}}
 const sandbox={console,crypto:require('node:crypto').webcrypto,
  document:{getElementById(id){if(!elements.has(id))elements.set(id,element());return elements.get(id)},createElement:element},
  localStorage:{getItem:k=>storage.get(k)||null,setItem:(k,v)=>storage.set(k,v)},
@@ -25,7 +25,7 @@ const sandbox={console,crypto:require('node:crypto').webcrypto,
  fetch:async(path,options)=>{requests.push({path,body:options?.body?JSON.parse(options.body):undefined});return {ok:true,json:async()=>({state:'idle',cards:[],analyses:{}})}},
  assert,requests,elements,storage,timers};
 vm.createContext(sandbox);vm.runInContext(source,sandbox);
-vm.runInContext("boxes=defaultBoxes();finalConfig=defaultFinalConfig();",sandbox);
+vm.runInContext("boxes=defaultBoxes();finalConfig=defaultFinalConfig();$('interval').value='180';$('transcription_interval_s').value='45';",sandbox);
 (async()=>{await vm.runInContext(process.argv[1],sandbox); console.log('PASS')})().catch(e=>{console.error(e);process.exitCode=1});
 """
         result = subprocess.run(["node", "-e", script, scenario], cwd=ROOT, text=True, capture_output=True)

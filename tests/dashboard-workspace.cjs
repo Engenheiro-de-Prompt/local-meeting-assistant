@@ -3,8 +3,14 @@ const {chromium}=require(process.env.MEETING_PLAYWRIGHT_MODULE||'playwright');
 const assert=require('node:assert/strict');
 const base=process.env.MEETING_TEST_URL||'http://127.0.0.1:18766';
 (async()=>{
- const browser=await chromium.launch({channel:'chrome',headless:true});
+ const server=await chromium.launchServer({channel:'chrome',headless:true});
+ // macOS Crashpad can inherit stderr and outlive Chrome. Playwright waits for
+ // ChildProcess 'close', not 'exit'; release that pipe only after Chrome exits.
+ if(process.platform==='darwin'){
+  const child=server.process();child.once('exit',()=>child.stderr?.destroy());
+ }
  try{
+  const browser=await chromium.connect(server.wsEndpoint());
   const page=await browser.newPage({viewport:{width:1400,height:1000}}),errors=[];
   page.on('pageerror',e=>errors.push(e.message));
   let state={state:'idle',cards:[],analyses:{},manual_notes:{text:'',items:[]},manual_notes_revision:0};
@@ -98,5 +104,5 @@ const base=process.env.MEETING_TEST_URL||'http://127.0.0.1:18766';
   assert.equal(await page.locator('#notesPanel > .layout-resize').isVisible(),false);
   assert.deepEqual(errors,[]);
   console.log(JSON.stringify({notes:true,checklist:true,draftReload:true,sessionSave:true,notInModelConfig:true,keyboardReorder:true,resize:true,dynamicCardsAndPolling:true,layoutReload:true,resetPreservesNotes:true,mobile:true,api:'synthetic intercepted, no audio or models'}));
- }finally{await browser.close()}
+ }finally{await server.close()}
 })().catch(e=>{console.error(e);process.exitCode=1});
