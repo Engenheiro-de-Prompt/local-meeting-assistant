@@ -45,8 +45,12 @@ class ManualNotesBrowserRoundtrip(unittest.TestCase):
                 thread.start()
                 try:
                     env = {**os.environ, 'MEETING_TEST_URL':f'http://127.0.0.1:{server.server_port}'}
-                    result = subprocess.run(['node','tests/dashboard-notes-roundtrip.cjs'],cwd=ROOT,env=env,text=True,capture_output=True,timeout=60)
-                    self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                    # Assert process completion, not just the success message printed
+                    # before browser teardown. Both runners must release Chrome's pipes.
+                    for script in ('dashboard-workspace.cjs', 'dashboard-notes-roundtrip.cjs'):
+                        result = subprocess.run(['node',f'tests/{script}'],cwd=ROOT,env=env,text=True,capture_output=True,timeout=45)
+                        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
+                        print(result.stdout.strip())
                     saved = json.loads((folder/'session.json').read_text())
                     self.assertEqual(saved['manual_notes']['text'],'Versão A confirmada; B continua local.')
                     self.assertTrue(saved['manual_notes']['items'][0]['checked'])
@@ -54,7 +58,6 @@ class ManualNotesBrowserRoundtrip(unittest.TestCase):
                     self.assertEqual((root/'synthetic-persistence.txt').read_bytes(),original_transcript)
                     restored = app.MeetingManager(root,ffmpeg='/usr/bin/ffmpeg').status()
                     self.assertEqual(restored['manual_notes'],saved['manual_notes'])
-                    print(result.stdout.strip())
                 finally:
                     server.shutdown(); server.server_close(); thread.join(timeout=2)
 

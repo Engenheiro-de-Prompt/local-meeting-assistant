@@ -200,10 +200,10 @@ class InitialManualNotesTests(unittest.TestCase):
             initial["items"].clear()
             source = root / "uploaded.wav"
             source.write_bytes(b"fixture-not-real-audio")
-            def decode(command, **_kwargs):
+            def decode(command, _chunks, **_kwargs):
                 pathlib.Path(command[-1].replace("%06d", "000000")).write_bytes(b"x" * 64)
                 return app.subprocess.CompletedProcess(command, 0)
-            with (patch.object(app.subprocess, "run", side_effect=decode),
+            with (patch("import_decode.decode_supervised", side_effect=decode),
                   patch.object(app.threading.Thread, "start"),
                   patch.object(manager, "_start_resource_monitor")):
                 status = manager.start_uploaded_file(config["token"], source, "uploaded.wav")

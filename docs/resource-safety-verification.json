@@ -1,0 +1,27 @@
+{
+  "timestamp": "2026-11-03T19:21:47.162330-03:00",
+  "tests_run": 215,
+  "failures": 0,
+  "errors": 0,
+  "skipped": 0,
+  "successful": true,
+  "elapsed_s": 62.31,
+  "chrome_enabled": true,
+  "real_whisper_smoke": {
+    "success": true,
+    "elapsed_s": 8.34,
+    "audio_played": false
+  },
+  "real_ollama_smoke": {
+    "success": true,
+    "elapsed_s": 22.02,
+    "model": "gemma4:e4b"
+  },
+  "limitations": [
+    "No meeting-under-load guarantee",
+    "No independent proof of Ollama server release after cancellation",
+    "No validated GPU/thermal monitoring",
+    "Native visual UI/energy budget not exercised"
+  ],
+  "evidence_scope": "Historical local validation only; rerun the suite for the published revision. Not proof of deployment or performance on other machines."
+}

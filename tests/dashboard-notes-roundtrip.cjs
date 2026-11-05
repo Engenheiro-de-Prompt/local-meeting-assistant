@@ -3,8 +3,14 @@ const {chromium}=require(process.env.MEETING_PLAYWRIGHT_MODULE||'playwright');
 const assert=require('node:assert/strict');
 (async()=>{
  const url=process.env.MEETING_TEST_URL;assert.ok(url,'Explicit temporary fixture URL required');
- const browser=await chromium.launch({channel:'chrome',headless:true});
+ const server=await chromium.launchServer({channel:'chrome',headless:true});
+ // macOS Crashpad can inherit stderr and outlive Chrome. Playwright waits for
+ // ChildProcess 'close', not 'exit'; release that pipe only after Chrome exits.
+ if(process.platform==='darwin'){
+  const child=server.process();child.once('exit',()=>child.stderr?.destroy());
+ }
  try{
+  const browser=await chromium.connect(server.wsEndpoint());
   const context=await browser.newContext({viewport:{width:1280,height:900}});
   const page=await context.newPage(),errors=[];
   page.on('pageerror',e=>errors.push(e.message));
@@ -50,5 +56,5 @@ const assert=require('node:assert/strict');
   await b.close();
   assert.deepEqual(errors,[]);
   console.log('Real browser -> local HTTP -> session.json -> reload + isolated conflicting tab recovery: OK');
- }finally{await browser.close()}
+ }finally{await server.close()}
 })().catch(e=>{console.error(e);process.exitCode=1});

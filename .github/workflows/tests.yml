@@ -24,8 +24,9 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Syntax checks
         run: |
-          python -m py_compile live_meeting_app.py tests/*.py
+          python -m py_compile *.py tests/*.py
           bash -n start.sh
+          for script in native-monitor/*.sh; do bash -n "$script"; done
           node --check web/manual-notes.js
           node --check web/dashboard-layout.js
           for script in tests/*.cjs; do node --check "$script"; done
